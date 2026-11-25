@@ -217,6 +217,14 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   }
 
   function cleanClone(clone) {
+    // 标题编号是渲染出来的数据而非按钮控件；转成普通元素，避免被 button 规则删掉
+    clone.querySelectorAll('.heading-order').forEach((el) => {
+      const span = document.createElement('span');
+      span.setAttribute('style', el.getAttribute('style') || '');
+      span.textContent = el.textContent;
+      el.replaceWith(span);
+    });
+
     clone.querySelectorAll(REMOVE_SELECTOR).forEach((el) => el.remove());
 
     [clone, ...clone.querySelectorAll('*')].forEach((el) => {
@@ -304,6 +312,23 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       box.append(...clone.querySelectorAll('table'));
       clone.replaceChildren(box);
     }
+    // 代码块可能嵌在列表/标注块里随父块整体克隆，按类名清理而不是只认块类型。
+    // 行号由 .code-line-wrapper 的伪元素渲染，伪元素消失后负边距会把代码左移遮住前几列；
+    // 标题编辑区的 scroll 是编辑态常显滚动条，静态页面改为按需显示。
+    clone.querySelectorAll('.code-block-line').forEach((el) => el.remove());
+    clone.querySelectorAll('.code-line-wrapper').forEach((el) => {
+      el.style.removeProperty('margin-left');
+      el.style.removeProperty('width');
+    });
+    clone.querySelectorAll('.code-block-caption-editor').forEach((el) => {
+      if (el.style.overflowX === 'scroll') el.style.overflowX = 'auto';
+    });
+    // 行号列删除后代码会贴着块边框，补回与代码块标题对齐的左侧缩进；
+    // overflow 的 auto 会被样式白名单当作默认值丢弃，长行代码会撑破导出页面，需要显式写回
+    clone.querySelectorAll('.code-block-content').forEach((el) => {
+      el.style.paddingLeft = '28px';
+      el.style.overflowX = 'auto';
+    });
     return clone;
   }
 
