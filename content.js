@@ -336,17 +336,23 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     });
   }
 
+  // 轮询等待条件成立；取消或超时即返回，由调用方决定降级方式
+  async function waitFor(predicate, timeout) {
+    const deadline = Date.now() + timeout;
+    while (!cancelRequested && !predicate() && Date.now() < deadline) await sleep(200);
+  }
+
   // 画板/嵌入块挂载后先显示加载骨架，骨架期间快照会得到空白或半张图，需等骨架消失再捕获
   async function waitForReady(block) {
-    const startedAt = Date.now();
-    while (!cancelRequested && block.isConnected && Date.now() - startedAt < 5000) {
-      const type = typeOf(block);
+    await waitFor(() => {
       // synced 容器里的画板也要等嵌套 canvas 挂载，否则同步块整体被拍成空白
       const needsCanvas =
-        type === 'whiteboard' || type === 'board' || !!block.querySelector('.docx-whiteboard-block');
-      if (!block.querySelector('.docx-block-loading-visible') && (!needsCanvas || block.querySelector('canvas'))) break;
-      await sleep(200);
-    }
+        typeOf(block) === 'whiteboard' || typeOf(block) === 'board' || !!block.querySelector('.docx-whiteboard-block');
+      return (
+        !block.isConnected ||
+        (!block.querySelector('.docx-block-loading-visible') && (!needsCanvas || block.querySelector('canvas')))
+      );
+    }, 5000);
     if (!cancelRequested && block.querySelector('canvas')) await sleep(200); // 等画布完成首帧绘制
   }
 
@@ -507,11 +513,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (!EMBED_TYPES[typeOf(live)]?.frame) continue;
       await waitForReady(live);
       if (cancelRequested) return;
-      let iframe = live.querySelector('iframe');
-      for (let i = 0; i < 15 && !iframe; i += 1) {
-        await sleep(200);
-        iframe = live.querySelector('iframe');
-      }
+      await waitFor(() => live.querySelector('iframe'), 3000);
+      const iframe = live.querySelector('iframe');
       if (!iframe) continue;
       await sleep(1200); // 等第三方组件在 iframe 内渲染完成
       const raw = await extractFrameSvg(iframe.src);
@@ -595,12 +598,10 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         layer.style.height = `${height * BOARD_SCALE}px`;
         // 引擎在容器尺寸变化后异步重绘，canvas 位图变大才算完成
         const grown = () => (layer.querySelector('canvas')?.width || 0) > baseWidth;
-        for (let i = 0; i < 15 && !grown(); i += 1) {
-          await sleep(200);
-        }
+        await waitFor(grown, 3000);
         const canvases = [...layer.querySelectorAll('canvas')];
         if (!canvases.length) continue;
-        if (canvases[0].width <= baseWidth) warn('board upscale timeout, using current canvas');
+        if (!grown()) warn('board upscale timeout, using current canvas');
         await sleep(200); // 等重绘帧提交
         const snapshot = document.createElement('canvas');
         snapshot.width = canvases[0].width;
