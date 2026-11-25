@@ -60,13 +60,13 @@ async function handleCaptureTab(sender) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;
-  // 监听器返回 Promise 是 Chrome 148 起逐步放量的能力，用 sendResponse 兼容所有版本
+  // 监听器返回 Promise 是 Chrome 148 起逐步放量的能力，用 sendResponse 兼容所有版本；端口已关闭时忽略投递失败
   if (message.type === 'extract-svg') {
-    handleExtractSvg(message, sender).then(sendResponse);
+    handleExtractSvg(message, sender).then(sendResponse, () => {});
     return true;
   }
   if (message.type === 'capture-tab') {
-    handleCaptureTab(sender).then(sendResponse);
+    handleCaptureTab(sender).then(sendResponse, () => {});
     return true;
   }
 });

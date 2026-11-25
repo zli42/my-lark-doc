@@ -602,7 +602,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         await waitFor(grown, 3000);
         const canvases = [...layer.querySelectorAll('canvas')];
         if (!canvases.length) continue;
-        if (!grown()) warn('board upscale timeout, using current canvas');
+        if (!cancelRequested && !grown()) warn('board upscale timeout, using current canvas');
         await sleep(200); // 等重绘帧提交
         const snapshot = document.createElement('canvas');
         snapshot.width = canvases[0].width;
