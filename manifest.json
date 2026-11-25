@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "148",
+  "name": "飞书文档导出 HTML",
+  "version": "1.0.0",
+  "description": "一键将可阅读的飞书文档导出为可离线阅读的单文件 HTML。",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://lf-fb.feishupkg.com/*"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "导出飞书文档为 HTML"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
