@@ -242,7 +242,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const label = EMBED_TYPES[type]?.label || `嵌入内容（${type}）`;
     const box = document.createElement('div');
     box.className = 'placeholder';
-    box.setAttribute('data-block-type', type);
 
     const title = document.createElement('div');
     title.className = 'placeholder-title';
