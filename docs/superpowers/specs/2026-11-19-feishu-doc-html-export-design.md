@@ -5,7 +5,8 @@
 更新：2026-11-24（第八次收敛：移除 background 冗余 URL 守卫、表格合并改用 replaceChildren、删多余 await；功能与保真度不变）
 更新：2026-11-24（第九次：画板快照改为 3 倍超采样，多 canvas 图层合成为单图）
 更新：2026-11-24（第十次：画板快照裁剪到内容边界并铺满栏宽，替换为轻量容器）
-状态：已实施（含嵌入图截图补采；Chrome 148+）
+更新：2026-11-25（第十一次收敛：消息监听改用 sendResponse 兼容灰度能力，版本下限修正为 117；抽出统一轮询与取消收尾，删除死参数、冗余嵌入判定与 Firefox 伪元素；导出能力与保真度不变）
+状态：已实施（含嵌入图截图补采；Chrome 117+）
 
 ## 1. 背景与目标
 
@@ -48,7 +49,7 @@
 - 使用 `activeTab` + `scripting`，点击图标时通过 `chrome.scripting.executeScript` 注入，除小组件 CDN 的窄域 host permission 外不申请常驻域名权限。
 - 页面内用 Blob + `<a download>` 触发下载，无需 `downloads` 权限。
 - 无需 popup、storage、content script 常驻声明。
-- 2026-11-24 复核（Chrome 157）：Chrome 148+ 的 `runtime.onMessage` 监听器可直接返回 Promise，后台改为 async handler；`scripting.executeScript` 会等待异步结果，`captureVisibleTab` 仍需 activeTab 权限。
+- 2026-11-25 复核：`runtime.onMessage` 监听器返回 Promise 是 Chrome 148 起、且逐步放量的能力，Chrome 官方文档建议用 `return true` + `sendResponse` 兼容未开启该能力的浏览器；代码实际最低运行时要求是 `Map.groupBy`（Chrome 117）。`scripting.executeScript` 会等待异步结果，`captureVisibleTab` 仍需 activeTab 权限。
 
 ## 3. 已确认的决策
 
@@ -77,7 +78,7 @@ my-lark-doc/
 ### 4.1 manifest.json
 
 - `manifest_version: 3`
-- `minimum_chrome_version: "148"`（Promise `runtime.onMessage` 监听器的最低版本）
+- `minimum_chrome_version: "117"`（代码用到的最新运行时能力是 `Map.groupBy`）
 - `permissions: ["activeTab", "scripting"]`
 - `host_permissions: ["https://lf-fb.feishupkg.com/*"]`（仅用于从小组件 iframe 提取矢量 SVG）
 - `background.service_worker: "background.js"`
@@ -90,8 +91,8 @@ my-lark-doc/
 - 仅校验 `tab.id`；不再读取 `tab.url`，受限页由 `executeScript` 抛错并记录。
 - 对当前标签执行 `chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] })`。
 - 注入失败（如权限或页面限制）时通过 `console.warn` 记录原因，不引入额外权限。
-- 监听 `chrome.runtime.onMessage`，用 async handler 处理 `extract-svg` 与 `capture-tab`；监听器直接返回 Promise（Chrome 148+），不使用 `sendResponse`。
-- `extract-svg` 对所有帧执行 `pickLargestSvg`，按 iframe URL 匹配并返回 SVG。
+- 监听 `chrome.runtime.onMessage`，用 async handler 处理 `extract-svg` 与 `capture-tab`；监听器调用 `sendResponse` 并 `return true` 保持通道——监听器返回 Promise 是 Chrome 148 起逐步放量的能力，官方建议不要依赖。
+- `extract-svg` 对所有帧执行 `pickLargestSvg`，按 iframe URL 匹配并返回 SVG；执行失败时 warn 并返回空 SVG，保证 `sendResponse` 一定被调用。
 - `capture-tab` 仅在前台标签页调用 `chrome.tabs.captureVisibleTab`，失败返回原因。
 
 ### 4.3 content.js
@@ -99,6 +100,7 @@ my-lark-doc/
 - 单文件 IIFE，无模块。
 - 使用 `window.__feishuDocExporterStart` 标记防止重复初始化与并发导出（保存 `start` 供重复注入复用）。
 - 选择器集中在文件顶部常量，便于飞书改版时维护。
+- 所有「轮询等待 DOM/画布就绪」共用 `waitFor(predicate, ms)`；取消与超时都由调用方降级。
 
 ## 5. 导出流程
 
@@ -271,3 +273,13 @@ my-lark-doc/
 - 页面无评论、工具栏、拖拽把手等残留。
 - 导出前后滚动位置一致。
 - 扩展仅申请 `activeTab`、`scripting`，以及小组件 CDN 的窄域 host permission。
+
+## 13. 第十一次收敛清单（2026-11-25）
+
+只做代码收敛，导出结果不变：
+
+- `background.js`：监听器改用 `sendResponse` + `return true`；`handleExtractSvg` 自行捕获失败并返回空 SVG，保证响应一定送达。
+- `manifest.json`：`minimum_chrome_version` 由 148 改为 117。
+- `content.js`：新增 `waitFor(predicate, ms)` 替换三处 200ms 轮询；新增 `finishIfCancelled()` 替换 `start()` 中三处取消收尾；删除 `waitForDomSettled` 的死参数 `maxMs`；`inEmbed` 去掉冗余的 `isKnownEmbed ||`；`replaceCanvases` 的失败语义写入注释并将变量改名 `canvasLost`；删除 overlay 的 `::-moz-progress-bar`。
+- `README.md`：Chrome 要求改为 117。
+- 明确不做：删除任何保真度路径（画板超采样/裁剪、iframe 截图补采、图片像素兜底、表格分次合并）、拆分 `content.js`、引入构建或测试框架。
