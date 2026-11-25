@@ -29,18 +29,22 @@ function pickLargestSvg() {
   return { href: location.href, svg: best };
 }
 
-// 失败时让 Promise 直接 reject，由内容脚本统一 warn 并回退截图
 async function handleExtractSvg(message, sender) {
   if (!sender.tab) return { svg: '' };
-  const base = String(message.src || '').split('?')[0];
-  const frames = await chrome.scripting.executeScript({
-    target: { tabId: sender.tab.id, allFrames: true },
-    func: pickLargestSvg,
-  });
-  const hit = frames.find(
-    (frame) => frame.result?.svg && frame.result.href.split('?')[0] === base
-  );
-  return { svg: hit?.result?.svg || '' };
+  try {
+    const base = String(message.src || '').split('?')[0];
+    const frames = await chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, allFrames: true },
+      func: pickLargestSvg,
+    });
+    const hit = frames.find(
+      (frame) => frame.result?.svg && frame.result.href.split('?')[0] === base
+    );
+    return { svg: hit?.result?.svg || '' };
+  } catch (error) {
+    console.warn('[feishu-doc-exporter] extract svg failed', error);
+    return { svg: '' };
+  }
 }
 
 async function handleCaptureTab(sender) {
@@ -54,8 +58,15 @@ async function handleCaptureTab(sender) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;
-  if (message.type === 'extract-svg') return handleExtractSvg(message, sender);
-  if (message.type === 'capture-tab') return handleCaptureTab(sender);
+  // 监听器返回 Promise 是 Chrome 148 起逐步放量的能力，用 sendResponse 兼容所有版本
+  if (message.type === 'extract-svg') {
+    handleExtractSvg(message, sender).then(sendResponse);
+    return true;
+  }
+  if (message.type === 'capture-tab') {
+    handleCaptureTab(sender).then(sendResponse);
+    return true;
+  }
 });

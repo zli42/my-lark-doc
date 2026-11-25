@@ -4,7 +4,7 @@
 
 ## 安装
 
-需要 Chrome 148 或更高版本（已在 Chrome 157 验证）。
+需要 Chrome 117 或更高版本（已在 Chrome 157 验证）。
 
 1. 打开 `chrome://extensions`
 2. 右上角开启「开发者模式」

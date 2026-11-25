@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "minimum_chrome_version": "148",
+  "minimum_chrome_version": "117",
   "name": "飞书文档导出 HTML",
   "version": "1.0.0",
   "description": "一键将可阅读的飞书文档导出为可离线阅读的单文件 HTML。",
