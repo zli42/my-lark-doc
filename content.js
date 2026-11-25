@@ -166,7 +166,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
-  // 画板等嵌入块用多个 canvas 图层叠加绘制，逐层导出会得到多张图片；合成一张
+  // 画板等嵌入块用多个 canvas 图层叠加绘制，逐层导出会得到多张图片；合成一张。
+  // 返回 true 表示 canvas 无法读取（已从克隆中删除），由调用方降级为占位块。
   function replaceCanvases(liveEl, cloneEl) {
     const liveCanvases = [...liveEl.querySelectorAll('canvas')];
     const cloneCanvases = [...cloneEl.querySelectorAll('canvas')];
@@ -270,8 +271,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const blockType = typeOf(block) || 'unknown';
     const isKnownEmbed = Object.hasOwn(EMBED_TYPES, blockType);
     // 块本身没有类型时，沿用最近带类型祖先的嵌入判定
-    const ownerType = block.closest('[data-block-type]')?.getAttribute('data-block-type');
-    const inEmbed = isKnownEmbed || Object.hasOwn(EMBED_TYPES, ownerType);
+    const embedOwner = block.closest('[data-block-type]')?.getAttribute('data-block-type');
+    const inEmbed = Object.hasOwn(EMBED_TYPES, embedOwner);
     // 顺序有依赖：样式与 canvas 只能从活节点读取，cleanClone 会删除克隆节点
     inlineStyles(block, clone, inEmbed);
 
@@ -283,7 +284,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       liveImages.set(cloneImgs[i], liveImgs[i]);
     }
 
-    const canvasFailed = replaceCanvases(block, clone);
+    const canvasLost = replaceCanvases(block, clone);
 
     // cleanClone 会删掉 iframe，先记下 src 供占位块使用
     const iframeSrc = block.querySelector('iframe')?.src || '';
@@ -293,7 +294,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const hasMedia = !!clone.querySelector('img');
     const hasText = textOf(clone).length > 0;
 
-    if (!hasMedia && (isKnownEmbed || canvasFailed || (iframeSrc && !hasText))) {
+    if (!hasMedia && (isKnownEmbed || canvasLost || (iframeSrc && !hasText))) {
       return makePlaceholder(blockType, clone.textContent, iframeSrc);
     }
     // 飞书表格的滚动/虚拟化包装层依赖页面脚本，静态 HTML 中会把宽表裁掉；
@@ -357,7 +358,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   }
 
   // 虚拟滚动换块时 DOM 会连续变更；静默 120ms 视为渲染完成，总时长仍以 WAIT_MS 为上限
-  function waitForDomSettled(pageEl, maxMs = WAIT_MS) {
+  function waitForDomSettled(pageEl) {
     return new Promise((resolve) => {
       let observer;
       let quietTimer;
@@ -373,7 +374,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         quietTimer = setTimeout(finish, 120);
       });
       observer.observe(pageEl, { childList: true, subtree: true, attributes: true });
-      hardTimer = setTimeout(finish, maxMs);
+      hardTimer = setTimeout(finish, WAIT_MS);
     });
   }
 
@@ -883,7 +884,6 @@ ${content}
         }
         progress::-webkit-progress-bar{background:transparent}
         progress::-webkit-progress-value{background:#3370ff;border-radius:2px;transition:var(--progress-value-transition)}
-        progress::-moz-progress-bar{background:#3370ff;border-radius:2px;transition:var(--progress-value-transition)}
         .sr-only{position:absolute;clip-path:inset(50%);overflow:hidden;width:1px;height:1px;
           margin:-1px;padding:0;border:0;white-space:nowrap}
         .ok .title{color:#2ea121}
