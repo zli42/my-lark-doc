@@ -957,6 +957,11 @@ ${content}
     const overlay = createOverlay(() => {
       cancelRequested = true;
     });
+    const finishIfCancelled = () => {
+      if (!cancelRequested) return false;
+      overlay.finish('已取消导出', 'info');
+      return true;
+    };
     try {
       const pageEl = document.querySelector(PAGE_SELECTOR);
       if (!pageEl) {
@@ -968,20 +973,14 @@ ${content}
       overlay.update('收集内容…', 0);
 
       const { blocks, limited } = await collectBlocks(pageEl, overlay);
-      if (cancelRequested) {
-        overlay.finish('已取消导出', 'info');
-        return;
-      }
+      if (finishIfCancelled()) return;
       if (!blocks.length) {
         overlay.finish('未找到文档内容', 'err');
         return;
       }
 
       const failedImages = await inlineImages(blocks, overlay);
-      if (cancelRequested) {
-        overlay.finish('已取消导出', 'info');
-        return;
-      }
+      if (finishIfCancelled()) return;
 
       overlay.update('生成文件…', 0.97);
       const html = buildHtml(title, blocks, theme, location.href);
@@ -993,10 +992,7 @@ ${content}
       const suffix = notes.length ? `（${notes.join('，')}）` : '';
       overlay.finish(`已导出 ${blocks.length} 个块，${(size / 1024 / 1024).toFixed(2)} MB${suffix}`, 'ok');
     } catch (error) {
-      if (cancelRequested) {
-        overlay.finish('已取消导出', 'info');
-        return;
-      }
+      if (finishIfCancelled()) return;
       console.error('[feishu-doc-exporter]', error);
       overlay.finish(`导出失败：${error?.message || error}`, 'err');
     } finally {
