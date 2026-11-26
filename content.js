@@ -273,7 +273,80 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     return box;
   }
 
-  function captureBlock(block) {
+  // 代码块的行只挂载页面视口附近的一段，首次可见时克隆会缺行；
+  // 块内可滚动时扫块内，块比视口高时扫页面，按行号补采全部行。
+  async function collectCodeLineSets(block, scroller, inEmbed, overlay) {
+    const contents = [...block.querySelectorAll('.code-block-content')];
+    if (!contents.length) return null;
+    const viewTop = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
+    const viewHeight = scroller.clientHeight;
+    const originPageTop = scroller.scrollTop;
+    const originTops = contents.map((content) => content.scrollTop);
+    const originStyles = contents.map((content) => content.getAttribute('style'));
+    const step = Math.max(300, Math.round(viewHeight * 0.8));
+    const results = [];
+    try {
+      for (const content of contents) {
+        const scrollable = content.scrollHeight > content.clientHeight + 40;
+        const rect = content.getBoundingClientRect();
+        const fullyVisible = rect.top >= viewTop && rect.bottom <= viewTop + viewHeight;
+        if (cancelRequested || (!scrollable && fullyVisible)) {
+          results.push(null);
+          continue;
+        }
+        const lines = new Map();
+        const harvest = () => {
+          for (const line of content.querySelectorAll('.code-line-wrapper')) {
+            const num = line.getAttribute('data-line-num');
+            if (num === null || lines.has(num)) continue;
+            // 每行包在独立的 .ace-line 里，克隆外层才能保留行布局
+            const unit = line.parentElement;
+            const clone = unit.cloneNode(true);
+            inlineStyles(unit, clone, inEmbed);
+            cleanClone(clone);
+            lines.set(num, clone);
+          }
+          overlay.update(`补采代码块… ${lines.size} 行`);
+        };
+        if (scrollable) {
+          // 窗口超过一屏会漏掉末尾几行，先压到一屏高再对齐视口顶
+          content.style.height = `${viewHeight}px`;
+          content.style.minHeight = `${viewHeight}px`;
+          content.style.maxHeight = `${viewHeight}px`;
+          scroller.scrollTop = Math.max(0, scroller.scrollTop + content.getBoundingClientRect().top - viewTop);
+          await sleep(WAIT_MS);
+          for (let top = 0; top <= content.scrollHeight && !cancelRequested; top += step) {
+            content.scrollTop = top;
+            await sleep(200);
+            harvest();
+          }
+        } else {
+          // 行随页面视口挂载：把页面从内容顶滚到内容底，覆盖整块
+          const start = Math.max(0, scroller.scrollTop + rect.top - viewTop);
+          for (let top = start; top <= start + content.clientHeight && !cancelRequested; top += step) {
+            scroller.scrollTop = top;
+            await sleep(200);
+            harvest();
+          }
+        }
+        results.push(
+          lines.size
+            ? [...lines.entries()].sort((a, b) => Number(a[0]) - Number(b[0])).map(([, el]) => el)
+            : null
+        );
+      }
+    } finally {
+      contents.forEach((content, i) => {
+        if (originStyles[i] === null) content.removeAttribute('style');
+        else content.setAttribute('style', originStyles[i]);
+        content.scrollTop = originTops[i];
+      });
+      scroller.scrollTop = originPageTop;
+    }
+    return results.some(Boolean) ? results : null;
+  }
+
+  function captureBlock(block, codeLineSets) {
     const clone = block.cloneNode(true);
     const blockType = typeOf(block) || 'unknown';
     const isKnownEmbed = Object.hasOwn(EMBED_TYPES, blockType);
@@ -311,6 +384,14 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       box.className = 'table-scroll';
       box.append(...clone.querySelectorAll('table'));
       clone.replaceChildren(box);
+    }
+    // 合并结果按 .code-block-content 的出现顺序替换；行元素已内联样式并清理
+    if (codeLineSets) {
+      clone.querySelectorAll('.code-block-content').forEach((content, i) => {
+        // 补采后行可能还没重新挂载，行容器用类名兜底
+        const zone = content.querySelector('.code-line-wrapper')?.parentElement?.parentElement || content.querySelector('.zone-container');
+        if (zone && codeLineSets[i]) zone.replaceChildren(...codeLineSets[i]);
+      });
     }
     // 代码块可能嵌在列表/标注块里随父块整体克隆，按类名清理而不是只认块类型。
     // 行号由 .code-line-wrapper 的伪元素渲染，伪元素消失后负边距会把代码左移遮住前几列；
@@ -663,7 +744,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
-  async function collectVisibleBlocks(pageEl, scroller, collected) {
+  async function collectVisibleBlocks(pageEl, scroller, collected, overlay) {
     const scrollerTop = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
     const viewBottom = scrollerTop + scroller.clientHeight;
     const visible = [];
@@ -693,7 +774,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         }
         continue;
       }
-      const el = captureBlock(block);
+      const embedOwner = block.closest('[data-block-type]')?.getAttribute('data-block-type');
+      const codeLineSets = block.querySelector('.code-block-content')
+        ? await collectCodeLineSets(block, scroller, Object.hasOwn(EMBED_TYPES, embedOwner), overlay)
+        : null;
+      if (cancelRequested) return;
+      const el = captureBlock(block, codeLineSets);
       const top = scroller.scrollTop + rect.top - scrollerTop;
       // waitForReady 后加载骨架消失，块高可能变化，需重新测量；top 仍用滚动前的位置排序
       collected.set(id, {
@@ -722,7 +808,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       }
       let pos = 0;
       while (!cancelRequested && steps < MAX_STEPS && Date.now() - startedAt < MAX_MS) {
-        await collectVisibleBlocks(pageEl, scroller, collected);
+        await collectVisibleBlocks(pageEl, scroller, collected, overlay);
         const height = scroller.scrollHeight;
         pos = Math.min(pos + Math.max(scroller.clientHeight * STEP_RATIO, 400), height);
         const settled = waitForDomSettled(pageEl);
@@ -737,7 +823,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         if (pos >= height - scroller.clientHeight) break;
       }
       if (!cancelRequested) {
-        await collectVisibleBlocks(pageEl, scroller, collected);
+        await collectVisibleBlocks(pageEl, scroller, collected, overlay);
         await upgradeBoardSnapshots(pageEl, scroller, collected, overlay);
         await captureEmbedScreenshots(pageEl, scroller, collected, overlay);
       }
@@ -950,7 +1036,7 @@ ${content}
       update(text, progress) {
         if (cancelled) return;
         msg.textContent = text;
-        bar.value = Math.round(progress * 100);
+        if (progress !== undefined) bar.value = Math.round(progress * 100);
       },
       hide() {
         host.style.display = 'none';
