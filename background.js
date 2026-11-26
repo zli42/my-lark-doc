@@ -34,15 +34,19 @@ async function handleExtractSvg(message, sender) {
   if (!sender.tab) return { svg: '' };
   try {
     const base = String(message.src || '').split('?')[0];
-    const frames = await chrome.scripting.executeScript({
-      target: { tabId: sender.tab.id, allFrames: true },
-      func: pickLargestSvg,
-      args: [base],
-    });
+    const run = (target) =>
+      chrome.scripting.executeScript({ target, func: pickLargestSvg, args: [base] });
+    // 先用上次命中的帧，未命中再扫全部帧兜底
+    let frames = Number.isInteger(message.frameId)
+      ? await run({ tabId: sender.tab.id, frameIds: [message.frameId] }).catch(() => null)
+      : null;
+    if (!frames?.some((frame) => frame.result?.svg)) {
+      frames = await run({ tabId: sender.tab.id, allFrames: true });
+    }
     const hit = frames.find(
       (frame) => frame.result?.svg && frame.result.href.split('?')[0] === base
     );
-    return { svg: hit?.result?.svg || '' };
+    return { svg: hit?.result?.svg || '', frameId: hit?.frameId };
   } catch (error) {
     console.warn('[feishu-doc-exporter] extract svg failed', error);
     return { svg: '' };

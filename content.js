@@ -416,9 +416,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     cleanClone(clone);
 
     const hasMedia = !!clone.querySelector('img');
-    const hasText = textOf(clone).length > 0;
 
-    if (!hasMedia && (isEmbedType(blockType) || canvasLost || (iframeSrc && !hasText))) {
+    if (!hasMedia && (isEmbedType(blockType) || canvasLost || (iframeSrc && !textOf(clone)))) {
       return makePlaceholder(blockType, clone.textContent, iframeSrc);
     }
     // 飞书表格的滚动/虚拟化包装层依赖页面脚本，静态 HTML 中会把宽表裁掉；
@@ -552,11 +551,19 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     });
   }
 
+  // 命中过 SVG 的帧，后续轮询只扫这一帧，避免每次都遍历全部 iframe
+  const svgFrameBySrc = new Map();
+
   // 小组件 iframe 里是矢量图表，直接取 SVG 比截图清晰，且放大不失真
   async function extractFrameSvg(src) {
     if (!src) return '';
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'extract-svg', src });
+      const response = await chrome.runtime.sendMessage({
+        type: 'extract-svg',
+        src,
+        frameId: svgFrameBySrc.get(src),
+      });
+      if (Number.isInteger(response?.frameId)) svgFrameBySrc.set(src, response.frameId);
       return response?.svg || '';
     } catch (error) {
       warn('extract svg failed', error);
@@ -627,9 +634,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const viewBottom = viewTop + viewHeight;
     overlay.hide();
     try {
-      await sleep(50); // 等浮层隐藏后的帧提交，避免被截进图里
+      await waitForPaint(); // 等浮层隐藏后的帧提交，避免被截进图里
       scroller.scrollTop += iframe.getBoundingClientRect().top - viewTop;
-      await sleep(WAIT_MS);
+      await waitForPaint();
       let canvas;
       let scale;
       for (let guard = 0; guard < 20; guard += 1) {
@@ -641,7 +648,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         if (sliceHeight < 4) {
           if (current.top <= viewTop) break;
           scroller.scrollTop += current.top - viewTop;
-          await sleep(WAIT_MS);
+          await waitForPaint();
           continue;
         }
         const { image, reason } = await captureViewport();
@@ -675,28 +682,28 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
-  // 小组件在 iframe 内渐进渲染：每 100ms 取一次 SVG，序列化长度连续两次一致且保持 150ms 才采用。
-  // 连续 4 次取不到矢量图（约 400ms）就回退截图，避免非 SVG 组件被拖到 3s 上限
+  // 小组件在 iframe 内渐进渲染：每 100ms 取一次 SVG，文本长度连续两次一致且保持 150ms 才采用。
+  // 判稳用原始文本，避免每轮都解析并序列化整棵 SVG；连续 4 次取不到矢量图（约 400ms）就回退截图
   async function extractStableSvg(src) {
     const deadline = Date.now() + 3000;
     let lastLength = 0;
     let stableSince = 0;
     let emptyTries = 0;
+    let text = '';
     while (!cancelRequested && Date.now() < deadline) {
-      const svg = parseSvg(await extractFrameSvg(src));
-      if (!svg) {
+      text = await extractFrameSvg(src);
+      if (!/<svg[\s>]/i.test(text)) {
         emptyTries += 1;
         if (emptyTries >= 4) return null;
         lastLength = 0;
         stableSince = 0;
       } else {
         emptyTries = 0;
-        const length = svg.outerHTML.length;
-        if (length === lastLength) {
+        if (text.length === lastLength) {
           if (!stableSince) stableSince = Date.now();
-          if (Date.now() - stableSince >= 150) return svg;
+          if (Date.now() - stableSince >= 150) return parseSvg(text);
         } else {
-          lastLength = length;
+          lastLength = text.length;
           stableSince = 0;
         }
       }
