@@ -318,7 +318,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const originPageTop = scroller.scrollTop;
     const originTops = contents.map((content) => content.scrollTop);
     const originStyles = contents.map((content) => content.getAttribute('style'));
-    const step = Math.max(300, Math.round(viewHeight * 0.8));
+    const step = Math.max(300, Math.round(viewHeight * STEP_RATIO));
     const results = [];
     try {
       for (const content of contents) {
@@ -505,26 +505,18 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     if (!cancelRequested && block.querySelector('canvas')) await waitForPaint(); // 等画布首帧提交
   }
 
-  // 虚拟滚动换块时 DOM 会连续变更；先确认滚动后确实有过渲染提交（DOM 变更或签名变化），
-  // 再等 3 帧无新变更视为完成（约 50ms）。无任何变更时保留 WAIT_MS 硬上限，
-  // 避免抢在虚拟列表挂载前采集导致漏块。
+  // 虚拟滚动换块时 DOM 会连续变更；变更静默 2 帧（约 33ms）视为渲染完成。
+  // 滚动后始终没有变更时保留 WAIT_MS 硬上限，避免抢在虚拟列表挂载前采集导致漏块。
   function waitForDomSettled(pageEl) {
     return new Promise((resolve) => {
-      const readSignature = () => {
-        const ids = [...pageEl.querySelectorAll(BLOCK_SELECTOR)].map((el) => el.getAttribute('data-record-id'));
-        return `${ids.join(',')}|${pageEl.scrollHeight}|${pageEl.querySelectorAll('.docx-block-loading-visible').length}`;
-      };
-      let signature = readSignature();
       let changed = false;
       let stableFrames = 0;
       let done = false;
-      const deadline = performance.now() + WAIT_MS;
       let hardTimer;
       const observer = new MutationObserver(() => {
         changed = true;
         stableFrames = 0;
       });
-      observer.observe(pageEl, { childList: true, subtree: true, attributes: true });
       const finish = () => {
         if (done) return;
         done = true;
@@ -532,18 +524,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         clearTimeout(hardTimer);
         resolve();
       };
+      observer.observe(pageEl, { childList: true, subtree: true, attributes: true });
       const check = () => {
         if (done) return;
-        const next = readSignature();
-        if (next !== signature) {
-          changed = true;
-          signature = next;
-          stableFrames = 0;
-        } else {
-          stableFrames += 1;
-        }
-        if (changed && stableFrames >= 2) finish();
-        else if (performance.now() >= deadline) finish();
+        if (changed) stableFrames += 1;
+        if (stableFrames >= 2) finish();
         else requestAnimationFrame(check);
       };
       hardTimer = setTimeout(finish, WAIT_MS);
@@ -666,7 +651,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         );
         if (sliceBottom >= current.bottom - 1) break;
         scroller.scrollTop += sliceHeight;
-        await sleep(Math.max(WAIT_MS, 500)); // 截图接口限制每秒 2 次
+        await sleep(500); // 截图接口限制每秒 2 次
       }
       if (!canvas) return { reason: '嵌入框架未完整显示' };
       const img = document.createElement('img');
