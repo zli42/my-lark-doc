@@ -108,6 +108,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 
   const typeOf = (el) => el.getAttribute('data-block-type') || '';
 
+  const isEmbedType = (type) => Object.hasOwn(EMBED_TYPES, type);
+
   // 去掉空白与零宽空格，用于判断是否有可见文字
   const textOf = (el) => (el.textContent || '').replace(/[\s\u200b]/g, '');
 
@@ -127,6 +129,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
     return document.scrollingElement;
   }
+
+  const getViewTop = (scroller) =>
+    scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
 
   function getTheme(pageEl) {
     const color = getComputedStyle(pageEl).color;
@@ -161,7 +166,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     for (let i = 0; i < liveEl.children.length && i < cloneEl.children.length; i += 1) {
       const child = liveEl.children[i];
       const type = child.getAttribute('data-block-type');
-      const childInEmbed = type === null ? inEmbed : Object.hasOwn(EMBED_TYPES, type);
+      const childInEmbed = type === null ? inEmbed : isEmbedType(type);
       inlineStyles(child, cloneEl.children[i], childInEmbed);
     }
   }
@@ -278,7 +283,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   async function collectCodeLineSets(block, scroller, inEmbed, overlay) {
     const contents = [...block.querySelectorAll('.code-block-content')];
     if (!contents.length) return null;
-    const viewTop = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
+    const viewTop = getViewTop(scroller);
     const viewHeight = scroller.clientHeight;
     const originPageTop = scroller.scrollTop;
     const originTops = contents.map((content) => content.scrollTop);
@@ -349,10 +354,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   function captureBlock(block, codeLineSets) {
     const clone = block.cloneNode(true);
     const blockType = typeOf(block) || 'unknown';
-    const isKnownEmbed = Object.hasOwn(EMBED_TYPES, blockType);
     // 块本身没有类型时，沿用最近带类型祖先的嵌入判定
     const embedOwner = block.closest('[data-block-type]')?.getAttribute('data-block-type');
-    const inEmbed = Object.hasOwn(EMBED_TYPES, embedOwner);
+    const inEmbed = isEmbedType(embedOwner);
     // 顺序有依赖：样式与 canvas 只能从活节点读取，cleanClone 会删除克隆节点
     inlineStyles(block, clone, inEmbed);
 
@@ -374,7 +378,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const hasMedia = !!clone.querySelector('img');
     const hasText = textOf(clone).length > 0;
 
-    if (!hasMedia && (isKnownEmbed || canvasLost || (iframeSrc && !hasText))) {
+    if (!hasMedia && (isEmbedType(blockType) || canvasLost || (iframeSrc && !hasText))) {
       return makePlaceholder(blockType, clone.textContent, iframeSrc);
     }
     // 飞书表格的滚动/虚拟化包装层依赖页面脚本，静态 HTML 中会把宽表裁掉；
@@ -553,7 +557,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   async function snapshotIframe(iframe, scroller, overlay) {
     const rect = iframe.getBoundingClientRect();
     if (rect.width < 8 || rect.height < 8) return { reason: '嵌入框架尺寸异常' };
-    const viewTop = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
+    const viewTop = getViewTop(scroller);
     const viewHeight = scroller.clientHeight;
     const viewBottom = viewTop + viewHeight;
     overlay.hide();
@@ -745,8 +749,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   }
 
   async function collectVisibleBlocks(pageEl, scroller, collected, overlay) {
-    const scrollerTop = scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top;
-    const viewBottom = scrollerTop + scroller.clientHeight;
+    const viewTop = getViewTop(scroller);
+    const viewBottom = viewTop + scroller.clientHeight;
     const visible = [];
     for (const block of pageEl.querySelectorAll(BLOCK_SELECTOR)) {
       if (cancelRequested) return;
@@ -756,7 +760,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (parent && parent !== pageEl) continue;
       // 只采视口内的块：屏幕外的媒体块还没渲染，提前捕获会拿到空白画布
       const rect = block.getBoundingClientRect();
-      if (rect.bottom < scrollerTop || rect.top > viewBottom) continue;
+      if (rect.bottom < viewTop || rect.top > viewBottom) continue;
       visible.push({ block, rect, id: block.getAttribute('data-record-id'), type });
     }
 
@@ -776,11 +780,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       }
       const embedOwner = block.closest('[data-block-type]')?.getAttribute('data-block-type');
       const codeLineSets = block.querySelector('.code-block-content')
-        ? await collectCodeLineSets(block, scroller, Object.hasOwn(EMBED_TYPES, embedOwner), overlay)
+        ? await collectCodeLineSets(block, scroller, isEmbedType(embedOwner), overlay)
         : null;
       if (cancelRequested) return;
       const el = captureBlock(block, codeLineSets);
-      const top = scroller.scrollTop + rect.top - scrollerTop;
+      const top = scroller.scrollTop + rect.top - viewTop;
       // waitForReady 后加载骨架消失，块高可能变化，需重新测量；top 仍用滚动前的位置排序
       collected.set(id, {
         top,
@@ -988,12 +992,12 @@ ${content}
         .cancel:focus-visible{outline:2px solid #3370ff;outline-offset:2px}
         .msg{color:#646a73;word-break:break-all;margin-top:6px}
         progress{display:block;inline-size:100%;block-size:4px;margin-top:10px;appearance:none;
-          border:0 solid;overflow:clip;background:#eff0f1;border-radius:2px;--progress-value-transition:none}
-        @media (prefers-reduced-motion: no-preference){
-          progress{--progress-value-transition:inline-size .2s}
-        }
+          border:0 solid;overflow:clip;background:#eff0f1;border-radius:2px}
         progress::-webkit-progress-bar{background:transparent}
-        progress::-webkit-progress-value{background:#3370ff;border-radius:2px;transition:var(--progress-value-transition)}
+        progress::-webkit-progress-value{background:#3370ff;border-radius:2px}
+        @media (prefers-reduced-motion: no-preference){
+          progress::-webkit-progress-value{transition:inline-size .2s}
+        }
         .sr-only{position:absolute;clip-path:inset(50%);overflow:hidden;width:1px;height:1px;
           margin:-1px;padding:0;border:0;white-space:nowrap}
         .ok .title{color:#2ea121}
