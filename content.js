@@ -10,7 +10,7 @@
   const WHITEBOARD_LAYER_SELECTOR = '.whiteboard_layer';
   const MAX_STEPS = 300;
   const MAX_MS = 180000;
-  const STEP_RATIO = 0.8;
+  const STEP_RATIO = 0.9;
   const WAIT_MS = 350;
   const IMAGE_CONCURRENCY = 16;
   const IMAGE_TIMEOUT_MS = 15000;
@@ -97,6 +97,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   const liveImages = new WeakMap();
   // 1 倍画布快照先不编码：画板增强成功时这张会被 5 倍图替换，只在兜底路径编码
   const pendingBoardCanvas = new WeakMap();
+  // 大图 PNG 编码在后台线程进行；flush 前统一等待，期间继续补采下一条
+  const pendingEncodes = new Set();
   let running = false;
   let cancelRequested = false;
   let imageInliner = null;
@@ -467,21 +469,26 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   }
 
   // 飞书表格只挂载视口附近的单元格内容，其余格子会退化成占位符；
-  // 每次滚到表格都重新捕获，逐格保留渲染更完整的那份。
-  function mergeTableCells(target, source) {
-    const incomingCells = new Map();
-    source.querySelectorAll('td[data-record-id]').forEach((cell) => {
-      incomingCells.set(cell.getAttribute('data-record-id'), cell);
-    });
+  // 每次滚到表格只重采已挂载的格子，逐格保留渲染更完整的那份，避免整表重克隆。
+  function mergeTableCells(target, liveBlock) {
+    const targetCells = new Map();
     target.querySelectorAll('td[data-record-id]').forEach((cell) => {
-      const incoming = incomingCells.get(cell.getAttribute('data-record-id'));
-      if (!incoming) return;
+      targetCells.set(cell.getAttribute('data-record-id'), cell);
+    });
+    liveBlock.querySelectorAll('td[data-record-id]').forEach((liveCell) => {
+      if (liveCell.querySelector('.bear-virtual-renderUnit-placeholder')) return;
+      const cell = targetCells.get(liveCell.getAttribute('data-record-id'));
+      if (!cell) return;
       const before = cellCompletion(cell);
-      const after = cellCompletion(incoming);
+      const after = cellCompletion(liveCell);
       const better =
         after.placeholders < before.placeholders ||
         (after.placeholders === before.placeholders && after.weight > before.weight);
-      if (better) cell.replaceChildren(...incoming.childNodes);
+      if (!better) return;
+      const captured = captureBlock(liveCell, null);
+      // 整格可能被降级成占位元素，此时保留占位元素本身而不是它的子节点
+      const next = captured.localName === 'td' ? [...captured.childNodes] : [captured];
+      cell.replaceChildren(...next);
     });
   }
 
@@ -540,19 +547,20 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   const svgFrameBySrc = new Map();
 
   // 小组件 iframe 里是矢量图表，直接取 SVG 比截图清晰，且放大不失真
-  async function extractFrameSvg(src) {
-    if (!src) return '';
+  async function extractFrameSvg(src, mode) {
+    if (!src) return { svg: '', sig: '' };
     try {
       const response = await chrome.runtime.sendMessage({
         type: 'extract-svg',
         src,
+        mode,
         frameId: svgFrameBySrc.get(src),
       });
       if (Number.isInteger(response?.frameId)) svgFrameBySrc.set(src, response.frameId);
-      return response?.svg || '';
+      return { svg: response?.svg || '', sig: response?.sig || '' };
     } catch (error) {
       warn('extract svg failed', error);
-      return '';
+      return { svg: '', sig: '' };
     }
   }
 
@@ -655,7 +663,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       }
       if (!canvas) return { reason: '嵌入框架未完整显示' };
       const img = document.createElement('img');
-      img.src = canvas.toDataURL('image/png');
+      encodeCanvasToImg(img, canvas);
       img.alt = '嵌入内容快照';
       img.style.cssText = `display:block;max-width:100%;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;`;
       return { img };
@@ -667,28 +675,30 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
-  // 小组件在 iframe 内渐进渲染：每 100ms 取一次 SVG，文本长度连续两次一致且保持 150ms 才采用。
-  // 判稳用原始文本，避免每轮都解析并序列化整棵 SVG；连续 4 次取不到矢量图（约 400ms）就回退截图
+  // 小组件在 iframe 内渐进渲染：每 100ms 取一次体积指纹，指纹连续两次一致且保持 150ms 才采用。
+  // 判稳只用指纹，避免每轮都序列化并传输整棵 SVG；连续 4 次取不到矢量图（约 400ms）就回退截图
   async function extractStableSvg(src) {
     const deadline = Date.now() + 3000;
-    let lastLength = 0;
+    let lastSig = '';
     let stableSince = 0;
     let emptyTries = 0;
-    let text = '';
     while (!cancelRequested && Date.now() < deadline) {
-      text = await extractFrameSvg(src);
-      if (!/<svg[\s>]/i.test(text)) {
+      const { sig } = await extractFrameSvg(src, 'probe');
+      if (!sig) {
         emptyTries += 1;
         if (emptyTries >= 4) return null;
-        lastLength = 0;
+        lastSig = '';
         stableSince = 0;
       } else {
         emptyTries = 0;
-        if (text.length === lastLength) {
+        if (sig === lastSig) {
           if (!stableSince) stableSince = Date.now();
-          if (Date.now() - stableSince >= 150) return parseSvg(text);
+          if (Date.now() - stableSince >= 150) {
+            const { svg } = await extractFrameSvg(src, 'full');
+            return parseSvg(svg);
+          }
         } else {
-          lastLength = text.length;
+          lastSig = sig;
           stableSince = 0;
         }
       }
@@ -793,7 +803,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       canvases.forEach((canvas) => context.drawImage(canvas, 0, 0));
       const box = boardContentBox(snapshot, cssWidth);
       if (!box) {
-        img.src = snapshot.toDataURL('image/png'); // 全透明画布没有可裁的内容
+        encodeCanvasToImg(img, snapshot); // 全透明画布没有可裁的内容
         return;
       }
       const cropped = document.createElement('canvas');
@@ -806,7 +816,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         figure.style[`margin${side}`] = boardEl.style[`margin${side}`] || '0px';
       });
       const croppedImg = document.createElement('img');
-      croppedImg.src = cropped.toDataURL('image/png');
+      encodeCanvasToImg(croppedImg, cropped);
       croppedImg.alt = '画布快照';
       croppedImg.style.cssText = 'display:block;width:100%;height:auto';
       figure.appendChild(croppedImg);
@@ -893,7 +903,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       const existing = collected.get(id);
       if (existing) {
         if (type === 'table' && existing.el.querySelector('.bear-virtual-renderUnit-placeholder')) {
-          mergeTableCells(existing.el, captureBlock(block));
+          mergeTableCells(existing.el, block);
           imageInliner?.enqueue(existing.el);
         }
         continue;
@@ -992,6 +1002,41 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
+  // 大画布 toDataURL 会同步编码并卡住主线程；toBlob 在后台编码，调用方先返回、flush 前统一等待
+  function encodeCanvasToImg(img, canvas) {
+    // toBlob 回调里抛错不会让 Promise 落定，兜底编码也必须自包一层
+    const fallback = () => {
+      try {
+        return canvas.toDataURL('image/png');
+      } catch (error) {
+        warn('encode image failed', error);
+        return '';
+      }
+    };
+    const task = new Promise((resolve) => {
+      try {
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            resolve(fallback());
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => resolve(fallback());
+          reader.readAsDataURL(blob);
+        }, 'image/png');
+      } catch {
+        resolve(fallback());
+      }
+    })
+      .then((url) => {
+        if (url) img.src = url;
+      })
+      .catch((error) => warn('encode image failed', error));
+    pendingEncodes.add(task);
+    task.finally(() => pendingEncodes.delete(task));
+  }
+
   // fetch 会受 CORS/临时网络故障影响；活节点可能已被虚拟滚动卸载，再按 URL 重新解码一次
   async function snapshotImage(img, src) {
     if (img?.complete && img.naturalWidth) {
@@ -1088,6 +1133,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       enqueue,
       async flush(blocks) {
         reporting = true;
+        // 等画板/嵌入图的异步 PNG 编码完成，确保 enqueue 时都已有 src
+        await Promise.all(pendingEncodes);
         // 增强成功时 1 倍快照已随旧节点离开文档，这里只给兜底路径补编码
         for (const block of blocks) {
           for (const img of block.querySelectorAll('img[alt="画布快照"]')) {
@@ -1242,6 +1289,7 @@ ${content}
     }
     running = true;
     cancelRequested = false;
+    pendingEncodes.clear();
     const overlay = createOverlay(() => {
       cancelRequested = true;
     });
@@ -1288,6 +1336,7 @@ ${content}
       running = false;
       cancelRequested = false;
       imageInliner = null;
+      pendingEncodes.clear();
     }
   }
 

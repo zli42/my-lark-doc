@@ -8,11 +8,14 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 // 在目标帧内执行：返回该帧里面积最大的 svg（小组件是 web component，需下钻 shadow root）
-function pickLargestSvg(targetSrc) {
+// probe 只回传体积指纹，避免每轮都把整棵 SVG 序列化后跨进程传输
+function pickLargestSvg(targetSrc, mode) {
   // 矢量图只可能出现在小组件子框架里，主帧与非目标帧无需扫描
-  if (window === window.top) return { href: location.href, svg: '' };
-  if (targetSrc && location.href.split('?')[0] !== targetSrc) return { href: location.href, svg: '' };
-  let best = '';
+  if (window === window.top) return { href: location.href, svg: '', sig: '' };
+  if (targetSrc && location.href.split('?')[0] !== targetSrc) {
+    return { href: location.href, svg: '', sig: '' };
+  }
+  let best = null;
   let bestArea = 0;
   const visit = (root) => {
     for (const el of root.querySelectorAll('*')) {
@@ -22,34 +25,49 @@ function pickLargestSvg(targetSrc) {
       const area = rect.width * rect.height;
       if (rect.width >= 120 && rect.height >= 80 && area > bestArea) {
         bestArea = area;
-        best = el.outerHTML;
+        best = el;
       }
     }
   };
   visit(document);
-  return { href: location.href, svg: best };
+  if (!best) return { href: location.href, svg: '', sig: '' };
+  if (mode === 'probe') {
+    return {
+      href: location.href,
+      svg: '',
+      sig: `${best.getElementsByTagName('*').length}:${(best.textContent || '').length}`,
+    };
+  }
+  return { href: location.href, svg: best.outerHTML, sig: '' };
 }
 
 async function handleExtractSvg(message, sender) {
-  if (!sender.tab) return { svg: '' };
+  if (!sender.tab) return { svg: '', sig: '' };
   try {
     const base = String(message.src || '').split('?')[0];
+    const mode = message.mode === 'probe' ? 'probe' : 'full';
     const run = (target) =>
-      chrome.scripting.executeScript({ target, func: pickLargestSvg, args: [base] });
+      chrome.scripting.executeScript({ target, func: pickLargestSvg, args: [base, mode] });
+    const hasSvg = (frames) => !!frames?.some((frame) => frame.result?.svg || frame.result?.sig);
     // 先用上次命中的帧，未命中再扫全部帧兜底
     let frames = Number.isInteger(message.frameId)
       ? await run({ tabId: sender.tab.id, frameIds: [message.frameId] }).catch(() => null)
       : null;
-    if (!frames?.some((frame) => frame.result?.svg)) {
+    if (!hasSvg(frames)) {
       frames = await run({ tabId: sender.tab.id, allFrames: true });
     }
     const hit = frames.find(
-      (frame) => frame.result?.svg && frame.result.href.split('?')[0] === base
+      (frame) =>
+        (frame.result?.svg || frame.result?.sig) && frame.result.href.split('?')[0] === base
     );
-    return { svg: hit?.result?.svg || '', frameId: hit?.frameId };
+    return {
+      svg: hit?.result?.svg || '',
+      sig: hit?.result?.sig || '',
+      frameId: hit?.frameId,
+    };
   } catch (error) {
     console.warn('[feishu-doc-exporter] extract svg failed', error);
-    return { svg: '' };
+    return { svg: '', sig: '' };
   }
 }
 
