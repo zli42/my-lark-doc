@@ -8,9 +8,10 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 // 在目标帧内执行：返回该帧里面积最大的 svg（小组件是 web component，需下钻 shadow root）
-function pickLargestSvg() {
-  // 矢量图只可能出现在小组件子框架里，主帧无需扫描
+function pickLargestSvg(targetSrc) {
+  // 矢量图只可能出现在小组件子框架里，主帧与非目标帧无需扫描
   if (window === window.top) return { href: location.href, svg: '' };
+  if (targetSrc && location.href.split('?')[0] !== targetSrc) return { href: location.href, svg: '' };
   let best = '';
   let bestArea = 0;
   const visit = (root) => {
@@ -36,6 +37,7 @@ async function handleExtractSvg(message, sender) {
     const frames = await chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, allFrames: true },
       func: pickLargestSvg,
+      args: [base],
     });
     const hit = frames.find(
       (frame) => frame.result?.svg && frame.result.href.split('?')[0] === base

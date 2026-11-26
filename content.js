@@ -12,7 +12,7 @@
   const MAX_MS = 180000;
   const STEP_RATIO = 0.8;
   const WAIT_MS = 350;
-  const IMAGE_CONCURRENCY = 6;
+  const IMAGE_CONCURRENCY = 10;
   const IMAGE_TIMEOUT_MS = 15000;
   const BOARD_SCALE = 3;
   const BOARD_CROP_PADDING = 8;
@@ -97,12 +97,22 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   const liveImages = new WeakMap();
   let running = false;
   let cancelRequested = false;
+  let imageInliner = null;
 
   const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
   const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // 连续两帧让浏览器提交渲染；后台标签 rAF 暂停时用 100ms 超时兜底
+  const waitForPaint = () => new Promise((resolve) => {
+    const timer = setTimeout(resolve, 100);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      clearTimeout(timer);
+      resolve();
+    }));
+  });
 
   const warn = (...args) => console.warn('[feishu-doc-exporter]', ...args);
 
@@ -144,7 +154,21 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     return { background: '#ffffff', color };
   }
 
-  function inlineStyles(liveEl, cloneEl, inEmbed) {
+  // 逐元素 textContent 会把 inlineStyles 拖成 O(n²)；先后序遍历一次，标出子树含可见文字的元素
+  function markTextElements(el, textSet) {
+    let hasText = false;
+    for (const child of el.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        if ((child.nodeValue || '').replace(/[\s\u200b]/g, '')) hasText = true;
+      } else if (child.nodeType === Node.ELEMENT_NODE && markTextElements(child, textSet)) {
+        hasText = true;
+      }
+    }
+    if (hasText) textSet.add(el);
+    return hasText;
+  }
+
+  function inlineStyles(liveEl, cloneEl, inEmbed, textSet) {
     cloneEl.removeAttribute('style');
     const computed = getComputedStyle(liveEl);
     // 导出后字体回退/容器宽度变化会让文本重新换行，固定高度会把后续块压上来；
@@ -152,7 +176,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const flowingText =
       !inEmbed &&
       (computed.position === 'static' || computed.position === 'relative') &&
-      textOf(liveEl).length > 0;
+      textSet.has(liveEl);
     for (const prop of STYLE_PROPS) {
       if (flowingText && (prop === 'height' || prop === 'min-height' || prop === 'max-height')) continue;
       const value = computed.getPropertyValue(prop);
@@ -167,7 +191,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       const child = liveEl.children[i];
       const type = child.getAttribute('data-block-type');
       const childInEmbed = type === null ? inEmbed : isEmbedType(type);
-      inlineStyles(child, cloneEl.children[i], childInEmbed);
+      inlineStyles(child, cloneEl.children[i], childInEmbed, textSet);
     }
   }
 
@@ -307,7 +331,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
             // 每行包在独立的 .ace-line 里，克隆外层才能保留行布局
             const unit = line.parentElement;
             const clone = unit.cloneNode(true);
-            inlineStyles(unit, clone, inEmbed);
+            const textSet = new WeakSet();
+            markTextElements(unit, textSet);
+            inlineStyles(unit, clone, inEmbed, textSet);
             cleanClone(clone);
             lines.set(num, clone);
           }
@@ -322,7 +348,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
           await sleep(WAIT_MS);
           for (let top = 0; top <= content.scrollHeight && !cancelRequested; top += step) {
             content.scrollTop = top;
-            await sleep(200);
+            await waitForPaint();
             harvest();
           }
         } else {
@@ -330,7 +356,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
           const start = Math.max(0, scroller.scrollTop + rect.top - viewTop);
           for (let top = start; top <= start + content.clientHeight && !cancelRequested; top += step) {
             scroller.scrollTop = top;
-            await sleep(200);
+            await waitForPaint();
             harvest();
           }
         }
@@ -358,7 +384,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const embedOwner = block.closest('[data-block-type]')?.getAttribute('data-block-type');
     const inEmbed = isEmbedType(embedOwner);
     // 顺序有依赖：样式与 canvas 只能从活节点读取，cleanClone 会删除克隆节点
-    inlineStyles(block, clone, inEmbed);
+    const textSet = new WeakSet();
+    markTextElements(block, textSet);
+    inlineStyles(block, clone, inEmbed, textSet);
 
     const liveImgs = block.querySelectorAll('img');
     const cloneImgs = clone.querySelectorAll('img');
@@ -449,7 +477,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   // 轮询等待条件成立；取消或超时即返回，由调用方决定降级方式
   async function waitFor(predicate, timeout) {
     const deadline = Date.now() + timeout;
-    while (!cancelRequested && !predicate() && Date.now() < deadline) await sleep(200);
+    while (!cancelRequested && !predicate() && Date.now() < deadline) await sleep(50);
   }
 
   // 画板/嵌入块挂载后先显示加载骨架，骨架期间快照会得到空白或半张图，需等骨架消失再捕获
@@ -466,24 +494,49 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     if (!cancelRequested && block.querySelector('canvas')) await sleep(200); // 等画布完成首帧绘制
   }
 
-  // 虚拟滚动换块时 DOM 会连续变更；静默 120ms 视为渲染完成，总时长仍以 WAIT_MS 为上限
+  // 虚拟滚动换块时 DOM 会连续变更；先确认滚动后确实有过渲染提交（DOM 变更或签名变化），
+  // 再等 3 帧无新变更视为完成（约 50ms）。无任何变更时保留 WAIT_MS 硬上限，
+  // 避免抢在虚拟列表挂载前采集导致漏块。
   function waitForDomSettled(pageEl) {
     return new Promise((resolve) => {
-      let observer;
-      let quietTimer;
+      const readSignature = () => {
+        const ids = [...pageEl.querySelectorAll(BLOCK_SELECTOR)].map((el) => el.getAttribute('data-record-id'));
+        return `${ids.join(',')}|${pageEl.scrollHeight}|${pageEl.querySelectorAll('.docx-block-loading-visible').length}`;
+      };
+      let signature = readSignature();
+      let changed = false;
+      let stableFrames = 0;
+      let done = false;
+      const deadline = performance.now() + WAIT_MS;
       let hardTimer;
+      const observer = new MutationObserver(() => {
+        changed = true;
+        stableFrames = 0;
+      });
+      observer.observe(pageEl, { childList: true, subtree: true, attributes: true });
       const finish = () => {
+        if (done) return;
+        done = true;
         observer.disconnect();
-        clearTimeout(quietTimer);
         clearTimeout(hardTimer);
         resolve();
       };
-      observer = new MutationObserver(() => {
-        clearTimeout(quietTimer);
-        quietTimer = setTimeout(finish, 120);
-      });
-      observer.observe(pageEl, { childList: true, subtree: true, attributes: true });
+      const check = () => {
+        if (done) return;
+        const next = readSignature();
+        if (next !== signature) {
+          changed = true;
+          signature = next;
+          stableFrames = 0;
+        } else {
+          stableFrames += 1;
+        }
+        if (changed && stableFrames >= 2) finish();
+        else if (performance.now() >= deadline) finish();
+        else requestAnimationFrame(check);
+      };
       hardTimer = setTimeout(finish, WAIT_MS);
+      requestAnimationFrame(check);
     });
   }
 
@@ -610,43 +663,50 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
-  async function captureEmbedScreenshots(pageEl, scroller, collected, overlay) {
-    const placeholders = [...collected].filter(([, item]) => item.isPlaceholder);
-    if (!placeholders.length) return;
-    overlay.update('补采嵌入图…', 0.7);
-    for (const [id, item] of placeholders) {
-      if (cancelRequested) return;
-      scroller.scrollTop = Math.max(0, item.top - (scroller.clientHeight - item.height) / 2);
-      await sleep(WAIT_MS);
-      const live = pageEl.querySelector(`.block[data-record-id="${id}"]`);
-      if (!live) continue;
-      if (!EMBED_TYPES[typeOf(live)]?.frame) continue;
-      await waitForReady(live);
-      if (cancelRequested) return;
-      await waitFor(() => live.querySelector('iframe'), 3000);
-      const iframe = live.querySelector('iframe');
-      if (!iframe) continue;
-      await sleep(1200); // 等第三方组件在 iframe 内渲染完成
-      const raw = await extractFrameSvg(iframe.src);
-      const svg = parseSvg(raw);
-      if (svg) {
-        item.el = svg;
-        continue;
+  // 小组件在 iframe 内渐进渲染：等 400ms 后每 300ms 取一次 SVG，序列化长度连续两次一致即采用。
+  // 连续 3 次取不到矢量图（约 1.2s）就回退截图，避免非 SVG 组件被拖到 3s 上限
+  async function extractStableSvg(src) {
+    await sleep(400);
+    const deadline = Date.now() + 3000;
+    let lastLength = 0;
+    let emptyTries = 0;
+    while (!cancelRequested && Date.now() < deadline) {
+      const svg = parseSvg(await extractFrameSvg(src));
+      if (!svg) {
+        emptyTries += 1;
+        if (emptyTries >= 3) return null;
+      } else {
+        emptyTries = 0;
+        const length = svg.outerHTML.length;
+        if (length === lastLength) return svg;
+        lastLength = length;
       }
-      if (raw) warn('矢量图解析失败，已回退截图');
-      if (cancelRequested) return;
-      const { img, reason } = await snapshotIframe(iframe, scroller, overlay);
-      if (cancelRequested) return;
-      if (img) {
-        item.el = img;
-        continue;
-      }
-      const note = document.createElement('div');
-      note.style.cssText = 'margin-top:4px;color:#d83931';
-      note.textContent = `未能自动截图：${reason}`;
-      item.el.appendChild(note);
-      warn('嵌入图截图失败：', reason);
+      await sleep(300);
     }
+    return null;
+  }
+
+  async function enhanceEmbed(item, live, scroller, overlay) {
+    await waitFor(() => live.querySelector('iframe'), 3000);
+    const iframe = live.querySelector('iframe');
+    if (!iframe) return;
+    const svg = await extractStableSvg(iframe.src);
+    if (svg) {
+      item.el = svg;
+      return;
+    }
+    if (cancelRequested) return;
+    const { img, reason } = await snapshotIframe(iframe, scroller, overlay);
+    if (cancelRequested) return;
+    if (img) {
+      item.el = img;
+      return;
+    }
+    const note = document.createElement('div');
+    note.style.cssText = 'margin-top:4px;color:#d83931';
+    note.textContent = `未能自动截图：${reason}`;
+    item.el.appendChild(note);
+    warn('嵌入图截图失败：', reason);
   }
 
   // 画板快照可能连大片空白画布一起导出；按 alpha 内容边界裁剪并留出内边距
@@ -680,71 +740,86 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   }
 
   // 画板 canvas 只有块尺寸那么大，超大画板的文字会糊；临时放大容器让引擎按高分辨率重绘后再取快照
-  async function upgradeBoardSnapshots(pageEl, scroller, collected, overlay) {
-    const boards = [...collected].filter(([, item]) =>
-      item.el.matches('.docx-whiteboard-block') || !!item.el.querySelector('.docx-whiteboard-block')
-    );
-    if (!boards.length) return;
-    overlay.update('提升画板清晰度…', 0.7);
-    for (const [id, item] of boards) {
+  async function enhanceBoard(item, live) {
+    const img = item.el.querySelector('img[alt="画布快照"]');
+    if (!img) return;
+    const layer = live.querySelector(WHITEBOARD_LAYER_SELECTOR);
+    const width = layer?.offsetWidth || 0;
+    const height = layer?.offsetHeight || 0;
+    const baseWidth = layer?.querySelector('canvas')?.width || 0;
+    if (!width || !height || !baseWidth) return;
+    const boardEl = item.el.matches('.docx-whiteboard-block') ? item.el : item.el.querySelector('.docx-whiteboard-block');
+    const cssWidth = parseFloat(img.style.width) || width;
+    const style = layer.getAttribute('style');
+    try {
+      layer.style.width = `${width * BOARD_SCALE}px`;
+      layer.style.height = `${height * BOARD_SCALE}px`;
+      // 引擎在容器尺寸变化后异步重绘，canvas 位图变大才算完成
+      const grown = () => (layer.querySelector('canvas')?.width || 0) > baseWidth;
+      await waitFor(grown, 3000);
+      const canvases = [...layer.querySelectorAll('canvas')];
+      if (!canvases.length) return;
+      if (!cancelRequested && !grown()) warn('board upscale timeout, using current canvas');
+      await sleep(200); // 等重绘帧提交
+      const snapshot = document.createElement('canvas');
+      snapshot.width = canvases[0].width;
+      snapshot.height = canvases[0].height;
+      const context = snapshot.getContext('2d');
+      canvases.forEach((canvas) => context.drawImage(canvas, 0, 0));
+      const box = boardContentBox(snapshot, cssWidth);
+      if (!box) {
+        img.src = snapshot.toDataURL('image/png'); // 全透明画布没有可裁的内容
+        return;
+      }
+      const cropped = document.createElement('canvas');
+      cropped.width = box.w;
+      cropped.height = box.h;
+      cropped.getContext('2d').drawImage(snapshot, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
+      // 裁掉空白画布后按原块宽铺满，块高随图片比例收缩
+      const figure = document.createElement('div');
+      ['Top', 'Right', 'Bottom', 'Left'].forEach((side) => {
+        figure.style[`margin${side}`] = boardEl.style[`margin${side}`] || '0px';
+      });
+      const croppedImg = document.createElement('img');
+      croppedImg.src = cropped.toDataURL('image/png');
+      croppedImg.alt = '画布快照';
+      croppedImg.style.cssText = 'display:block;width:100%;height:auto';
+      figure.appendChild(croppedImg);
+      boardEl.replaceWith(figure);
+      if (boardEl === item.el) item.el = figure;
+    } catch (error) {
+      warn('board upscale failed', error);
+    } finally {
+      if (style === null) layer.removeAttribute('style');
+      else layer.setAttribute('style', style);
+    }
+  }
+
+  // 画板清晰化与嵌入补采原先各扫一趟、各自滚动定位；合并为按文档顺序的一趟
+  async function enhanceMedia(pageEl, scroller, collected, overlay) {
+    const items = [];
+    for (const [id, item] of collected) {
+      const isBoard = item.el.matches('.docx-whiteboard-block') || !!item.el.querySelector('.docx-whiteboard-block');
+      if (isBoard) {
+        if (item.el.querySelector('img[alt="画布快照"]')) items.push({ id, item, kind: 'board' });
+      } else if (item.isPlaceholder) {
+        items.push({ id, item, kind: 'embed' });
+      }
+    }
+    if (!items.length) return;
+    items.sort((a, b) => a.item.top - b.item.top);
+    overlay.update('补采嵌入内容…', 0.7);
+    for (const { id, item, kind } of items) {
       if (cancelRequested) return;
-      const img = item.el.querySelector('img[alt="画布快照"]');
-      if (!img) continue;
       scroller.scrollTop = Math.max(0, item.top - (scroller.clientHeight - item.height) / 2);
       await sleep(WAIT_MS);
       const live = pageEl.querySelector(`.block[data-record-id="${id}"]`);
       if (!live) continue;
-      await waitForReady(live); // 长文档滚动后画布可能刚挂载
-      const layer = live.querySelector(WHITEBOARD_LAYER_SELECTOR);
-      const width = layer?.offsetWidth || 0;
-      const height = layer?.offsetHeight || 0;
-      const baseWidth = layer?.querySelector('canvas')?.width || 0;
-      if (!width || !height || !baseWidth) continue;
-      const boardEl = item.el.matches('.docx-whiteboard-block') ? item.el : item.el.querySelector('.docx-whiteboard-block');
-      const cssWidth = parseFloat(img.style.width) || width;
-      const style = layer.getAttribute('style');
-      try {
-        layer.style.width = `${width * BOARD_SCALE}px`;
-        layer.style.height = `${height * BOARD_SCALE}px`;
-        // 引擎在容器尺寸变化后异步重绘，canvas 位图变大才算完成
-        const grown = () => (layer.querySelector('canvas')?.width || 0) > baseWidth;
-        await waitFor(grown, 3000);
-        const canvases = [...layer.querySelectorAll('canvas')];
-        if (!canvases.length) continue;
-        if (!cancelRequested && !grown()) warn('board upscale timeout, using current canvas');
-        await sleep(200); // 等重绘帧提交
-        const snapshot = document.createElement('canvas');
-        snapshot.width = canvases[0].width;
-        snapshot.height = canvases[0].height;
-        const context = snapshot.getContext('2d');
-        canvases.forEach((canvas) => context.drawImage(canvas, 0, 0));
-        const box = boardContentBox(snapshot, cssWidth);
-        if (!box) {
-          img.src = snapshot.toDataURL('image/png'); // 全透明画布没有可裁的内容
-          continue;
-        }
-        const cropped = document.createElement('canvas');
-        cropped.width = box.w;
-        cropped.height = box.h;
-        cropped.getContext('2d').drawImage(snapshot, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
-        // 裁掉空白画布后按原块宽铺满，块高随图片比例收缩
-        const figure = document.createElement('div');
-        ['Top', 'Right', 'Bottom', 'Left'].forEach((side) => {
-          figure.style[`margin${side}`] = boardEl.style[`margin${side}`] || '0px';
-        });
-        const croppedImg = document.createElement('img');
-        croppedImg.src = cropped.toDataURL('image/png');
-        croppedImg.alt = '画布快照';
-        croppedImg.style.cssText = 'display:block;width:100%;height:auto';
-        figure.appendChild(croppedImg);
-        boardEl.replaceWith(figure);
-        if (boardEl === item.el) item.el = figure;
-      } catch (error) {
-        warn('board upscale failed', error);
-      } finally {
-        if (style === null) layer.removeAttribute('style');
-        else layer.setAttribute('style', style);
-      }
+      if (kind === 'embed' && !EMBED_TYPES[typeOf(live)]?.frame) continue;
+      await waitForReady(live); // 长文档滚动后画布/嵌入可能刚挂载
+      if (cancelRequested) return;
+      if (kind === 'board') await enhanceBoard(item, live);
+      else await enhanceEmbed(item, live, scroller, overlay);
     }
   }
 
@@ -775,6 +850,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (existing) {
         if (type === 'table' && existing.el.querySelector('.bear-virtual-renderUnit-placeholder')) {
           mergeTableCells(existing.el, captureBlock(block));
+          imageInliner?.enqueue(existing.el);
         }
         continue;
       }
@@ -784,6 +860,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         : null;
       if (cancelRequested) return;
       const el = captureBlock(block, codeLineSets);
+      imageInliner?.enqueue(el);
       const top = scroller.scrollTop + rect.top - viewTop;
       // waitForReady 后加载骨架消失，块高可能变化，需重新测量；top 仍用滚动前的位置排序
       collected.set(id, {
@@ -824,12 +901,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         steps += 1;
         // 触底后不再进入下一轮收集，末屏同样要等渲染稳定再补采
         await settled;
-        if (pos >= height - scroller.clientHeight) break;
+        if (pos >= scroller.scrollHeight - scroller.clientHeight) break;
       }
       if (!cancelRequested) {
         await collectVisibleBlocks(pageEl, scroller, collected, overlay);
-        await upgradeBoardSnapshots(pageEl, scroller, collected, overlay);
-        await captureEmbedScreenshots(pageEl, scroller, collected, overlay);
+        await enhanceMedia(pageEl, scroller, collected, overlay);
       }
       const limited = steps >= MAX_STEPS || Date.now() - startedAt >= MAX_MS;
       return {
@@ -893,40 +969,85 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     return drawToDataUrl(fresh);
   }
 
-  async function inlineImages(blocks, overlay) {
-    const images = blocks.flatMap((block) => [...block.querySelectorAll('img')]);
-    const valid = [];
-    for (const img of images) {
-      if (img.getAttribute('src')) valid.push(img);
-      else img.remove();
-    }
-    const entries = [...Map.groupBy(valid, (img) => img.getAttribute('src'))];
+  // 图片内联流水线：捕获块时立即入队下载，与滚动采集重叠；flush 时等待队列完成并清扫晚到的图片
+  function createImageInliner(overlay) {
+    const cache = new Map();
+    const seen = new WeakSet();
+    const queue = [];
+    let active = 0;
     let done = 0;
+    let total = 0;
     let failed = 0;
-    let next = 0;
-    const worker = async () => {
-      while (!cancelRequested && next < entries.length) {
-        const [src, group] = entries[next];
-        next += 1;
-        let dataUrl = await toDataUrl(src).catch(() => null);
-        if (cancelRequested) return;
-        if (!dataUrl) dataUrl = await snapshotImage(liveImages.get(group[0]), src);
-        if (cancelRequested) return;
-        for (const img of group) {
-          if (dataUrl) img.setAttribute('src', dataUrl);
-          else {
-            failed += 1;
-            img.setAttribute('title', '图片未能内联，需要联网查看');
-          }
-        }
-        done += group.length;
-        overlay.update(`处理图片 ${done}/${valid.length}`, 0.7 + (0.25 * done) / valid.length);
+    let reporting = false;
+
+    const pump = () => {
+      while (active < IMAGE_CONCURRENCY && queue.length) {
+        const job = queue.shift();
+        active += 1;
+        job().finally(() => {
+          active -= 1;
+          pump();
+        });
       }
     };
-    await Promise.all(
-      Array.from({ length: Math.min(IMAGE_CONCURRENCY, entries.length) }, worker)
-    );
-    return failed;
+
+    const fetchOnce = (src, liveImg) => {
+      if (!cache.has(src)) {
+        cache.set(src, new Promise((resolve) => {
+          queue.push(async () => {
+            if (cancelRequested) {
+              resolve('');
+              return;
+            }
+            let dataUrl = await toDataUrl(src).catch(() => null);
+            if (!dataUrl && !cancelRequested) dataUrl = await snapshotImage(liveImg, src);
+            resolve(dataUrl || '');
+          });
+          pump();
+        }));
+      }
+      return cache.get(src);
+    };
+
+    const apply = (img, dataUrl) => {
+      if (dataUrl) {
+        img.setAttribute('src', dataUrl);
+        return;
+      }
+      failed += 1;
+      img.setAttribute('title', '图片未能内联，需要联网查看');
+    };
+
+    const enqueue = (root) => {
+      for (const img of root.querySelectorAll('img')) {
+        if (seen.has(img)) continue;
+        const src = img.getAttribute('src');
+        if (!src) {
+          img.remove();
+          continue;
+        }
+        if (src.startsWith('data:')) continue;
+        seen.add(img);
+        total += 1;
+        fetchOnce(src, liveImages.get(img)).then((dataUrl) => {
+          done += 1;
+          apply(img, dataUrl);
+          if (reporting) {
+            overlay.update(`处理图片 ${done}/${total}`, 0.7 + (0.25 * done) / Math.max(total, 1));
+          }
+        });
+      }
+    };
+
+    return {
+      enqueue,
+      async flush(blocks) {
+        reporting = true;
+        blocks.forEach((block) => enqueue(block));
+        await Promise.all([...cache.values()]);
+        return failed;
+      },
+    };
   }
 
   function buildHtml(title, blocks, theme, sourceUrl) {
@@ -1086,6 +1207,7 @@ ${content}
       const theme = getTheme(pageEl);
       overlay.update('收集内容…', 0);
 
+      imageInliner = createImageInliner(overlay);
       const { blocks, limited } = await collectBlocks(pageEl, overlay);
       if (finishIfCancelled()) return;
       if (!blocks.length) {
@@ -1093,7 +1215,7 @@ ${content}
         return;
       }
 
-      const failedImages = await inlineImages(blocks, overlay);
+      const failedImages = await imageInliner.flush(blocks);
       if (finishIfCancelled()) return;
 
       overlay.update('生成文件…', 0.97);
@@ -1112,6 +1234,7 @@ ${content}
     } finally {
       running = false;
       cancelRequested = false;
+      imageInliner = null;
     }
   }
 
