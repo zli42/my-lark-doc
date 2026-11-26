@@ -103,6 +103,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   let cancelRequested = false;
   let imageInliner = null;
 
+  // 分阶段耗时与规模计数，导出结束在控制台输出一行，用于判断瓶颈在等待、编码还是内联
+  const stats = {
+    steps: 0, settleMs: 0, settleCap: 0, encodeMs: 0, encodePx: 0,
+    imgCount: 0, imgBytes: 0, probeRounds: 0,
+  };
+
   const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
   const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
@@ -163,7 +169,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     let hasText = false;
     for (const child of el.childNodes) {
       if (child.nodeType === Node.TEXT_NODE) {
-        if ((child.nodeValue || '').replace(/[\s\u200b]/g, '')) hasText = true;
+        if (/[^\s\u200b]/.test(child.nodeValue || '')) hasText = true;
       } else if (child.nodeType === Node.ELEMENT_NODE && markTextElements(child, textSet)) {
         hasText = true;
       }
@@ -458,15 +464,14 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     return clone;
   }
 
-  function cellCompletion(cell) {
-    return {
-      placeholders: cell.querySelectorAll('.bear-virtual-renderUnit-placeholder').length,
-      weight:
-        cell.querySelectorAll('.block').length +
-        cell.querySelectorAll('img, canvas').length +
-        textOf(cell).length,
-    };
-  }
+  const countPlaceholders = (cell) =>
+    cell.querySelectorAll('.bear-virtual-renderUnit-placeholder').length;
+
+  // 权重含整格 textContent，只在占位符数量持平时才需要计算
+  const cellWeight = (cell) =>
+    cell.querySelectorAll('.block').length +
+    cell.querySelectorAll('img, canvas').length +
+    textOf(cell).length;
 
   // 飞书表格只挂载视口附近的单元格内容，其余格子会退化成占位符；
   // 每次滚到表格只重采已挂载的格子，逐格保留渲染更完整的那份，避免整表重克隆。
@@ -479,11 +484,10 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (liveCell.querySelector('.bear-virtual-renderUnit-placeholder')) return;
       const cell = targetCells.get(liveCell.getAttribute('data-record-id'));
       if (!cell) return;
-      const before = cellCompletion(cell);
-      const after = cellCompletion(liveCell);
+      const before = countPlaceholders(cell);
+      const after = countPlaceholders(liveCell);
       const better =
-        after.placeholders < before.placeholders ||
-        (after.placeholders === before.placeholders && after.weight > before.weight);
+        after < before || (after === before && cellWeight(liveCell) > cellWeight(cell));
       if (!better) return;
       const captured = captureBlock(liveCell, null);
       // 整格可能被降级成占位元素，此时保留占位元素本身而不是它的子节点
@@ -492,10 +496,19 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     });
   }
 
+  // 帧对齐轮询：渲染变化在帧提交后才可见；后台标签 rAF 暂停时用 50ms 超时兜底
+  const nextTick = () => new Promise((resolve) => {
+    const timer = setTimeout(resolve, 50);
+    requestAnimationFrame(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
   // 轮询等待条件成立；取消或超时即返回，由调用方决定降级方式
   async function waitFor(predicate, timeout) {
     const deadline = Date.now() + timeout;
-    while (!cancelRequested && !predicate() && Date.now() < deadline) await sleep(50);
+    while (!cancelRequested && !predicate() && Date.now() < deadline) await nextTick();
   }
 
   // 画板/嵌入块挂载后先显示加载骨架，骨架期间快照会得到空白或半张图，需等骨架消失再捕获
@@ -516,6 +529,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   // 滚动后始终没有变更时保留 WAIT_MS 硬上限，避免抢在虚拟列表挂载前采集导致漏块。
   function waitForDomSettled(pageEl) {
     return new Promise((resolve) => {
+      const startedAt = performance.now();
       let changed = false;
       let stableFrames = 0;
       let done = false;
@@ -527,6 +541,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       const finish = () => {
         if (done) return;
         done = true;
+        stats.settleMs += performance.now() - startedAt;
         observer.disconnect();
         clearTimeout(hardTimer);
         resolve();
@@ -538,7 +553,10 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         if (stableFrames >= 2) finish();
         else requestAnimationFrame(check);
       };
-      hardTimer = setTimeout(finish, WAIT_MS);
+      hardTimer = setTimeout(() => {
+        stats.settleCap += 1;
+        finish();
+      }, WAIT_MS);
       requestAnimationFrame(check);
     });
   }
@@ -683,6 +701,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     let stableSince = 0;
     let emptyTries = 0;
     while (!cancelRequested && Date.now() < deadline) {
+      stats.probeRounds += 1;
       const { sig } = await extractFrameSvg(src, 'probe');
       if (!sig) {
         emptyTries += 1;
@@ -938,6 +957,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const originBehavior = scroller.style.scrollBehavior;
     const collected = new Map();
     const startedAt = Date.now();
+    const collectStartedAt = performance.now();
     let steps = 0;
 
     try {
@@ -963,16 +983,19 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         await settled;
         if (pos >= scroller.scrollHeight - scroller.clientHeight) break;
       }
+      const collectedMs = Math.round(performance.now() - collectStartedAt);
       if (!cancelRequested) {
         await collectVisibleBlocks(pageEl, scroller, collected, overlay);
         await enhanceMedia(pageEl, scroller, collected, overlay);
       }
-      const limited = steps >= MAX_STEPS || Date.now() - startedAt >= MAX_MS;
+      stats.steps = steps;
       return {
         blocks: [...collected.values()]
           .sort((a, b) => a.top - b.top)
           .map((item) => item.el),
-        limited,
+        limited: steps >= MAX_STEPS || Date.now() - startedAt >= MAX_MS,
+        collectMs: collectedMs,
+        enhanceMs: Math.round(performance.now() - collectStartedAt) - collectedMs,
       };
     } finally {
       scroller.scrollTop = origin;
@@ -1019,9 +1042,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         return '';
       }
     };
+    const startedAt = performance.now();
     const task = new Promise((resolve) => {
       try {
         canvas.toBlob((blob) => {
+          stats.encodeMs += performance.now() - startedAt;
+          stats.encodePx += canvas.width * canvas.height;
           if (!blob) {
             resolve(fallback());
             return;
@@ -1106,6 +1132,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 
     const apply = (img, dataUrl) => {
       if (dataUrl) {
+        stats.imgCount += 1;
+        stats.imgBytes += dataUrl.length;
         img.setAttribute('src', dataUrl);
         return;
       }
@@ -1156,9 +1184,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     };
   }
 
-  function buildHtml(title, blocks, theme, sourceUrl) {
-    const content = blocks.map((el) => el.outerHTML).join('\n');
-    return `<!doctype html>
+  function buildHtmlParts(title, blocks, theme, sourceUrl) {
+    const parts = [`<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -1171,11 +1198,18 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 <main class="export-root">
 <h1>${esc(title)}</h1>
 <div class="export-content">
-${content}
+`];
+    // 逐块作为 Blob 分片，避免先把整篇文档 join 成一个字符串
+    blocks.forEach((el, i) => {
+      if (i) parts.push('\n');
+      parts.push(el.outerHTML);
+    });
+    parts.push(`
 </div>
 </main>
 </body>
-</html>`;
+</html>`);
+    return parts;
   }
 
   function sanitizeFilename(name) {
@@ -1187,8 +1221,8 @@ ${content}
     return cleaned || '飞书文档';
   }
 
-  function downloadHtml(filename, html) {
-    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  function downloadHtml(filename, parts) {
+    const blob = new Blob(parts, { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
@@ -1296,6 +1330,9 @@ ${content}
     running = true;
     cancelRequested = false;
     pendingEncodes.clear();
+    for (const key of Object.keys(stats)) stats[key] = 0;
+    const startedAt = performance.now();
+    const profile = {};
     const overlay = createOverlay(() => {
       cancelRequested = true;
     });
@@ -1315,19 +1352,25 @@ ${content}
       overlay.update('收集内容…', 0);
 
       imageInliner = createImageInliner(overlay);
-      const { blocks, limited } = await collectBlocks(pageEl, overlay);
+      const { blocks, limited, collectMs, enhanceMs } = await collectBlocks(pageEl, overlay);
+      profile.collectMs = collectMs;
+      profile.enhanceMs = enhanceMs;
       if (finishIfCancelled()) return;
       if (!blocks.length) {
         overlay.finish('未找到文档内容', 'err');
         return;
       }
 
+      const flushStartedAt = performance.now();
       const failedImages = await imageInliner.flush(blocks);
+      profile.flushMs = Math.round(performance.now() - flushStartedAt);
       if (finishIfCancelled()) return;
 
+      const buildStartedAt = performance.now();
       overlay.update('生成文件…', 0.97);
-      const html = buildHtml(title, blocks, theme, location.href);
-      const size = downloadHtml(`${sanitizeFilename(title)}.html`, html);
+      const parts = buildHtmlParts(title, blocks, theme, location.href);
+      const size = downloadHtml(`${sanitizeFilename(title)}.html`, parts);
+      profile.buildMs = Math.round(performance.now() - buildStartedAt);
 
       const notes = [];
       if (limited) notes.push('可能不完整');
@@ -1343,6 +1386,13 @@ ${content}
       cancelRequested = false;
       imageInliner = null;
       pendingEncodes.clear();
+      console.info('[feishu-doc-exporter] profile', {
+        ...stats,
+        settleMs: Math.round(stats.settleMs),
+        encodeMs: Math.round(stats.encodeMs),
+        ...profile,
+        totalMs: Math.round(performance.now() - startedAt),
+      });
     }
   }
 
