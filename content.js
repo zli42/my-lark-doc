@@ -103,12 +103,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   let cancelRequested = false;
   let imageInliner = null;
 
-  // 分阶段耗时与规模计数，导出结束在控制台输出一行，用于判断瓶颈在等待、编码还是内联
-  const stats = {
-    steps: 0, settleMs: 0, settleCap: 0, encodeMs: 0, encodePx: 0,
-    imgCount: 0, imgBytes: 0, probeRounds: 0,
-  };
-
   const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
   const esc = (value) => String(value).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
@@ -529,7 +523,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   // 滚动后始终没有变更时保留 WAIT_MS 硬上限，避免抢在虚拟列表挂载前采集导致漏块。
   function waitForDomSettled(pageEl) {
     return new Promise((resolve) => {
-      const startedAt = performance.now();
       let changed = false;
       let stableFrames = 0;
       let done = false;
@@ -541,7 +534,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       const finish = () => {
         if (done) return;
         done = true;
-        stats.settleMs += performance.now() - startedAt;
         observer.disconnect();
         clearTimeout(hardTimer);
         resolve();
@@ -553,10 +545,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         if (stableFrames >= 2) finish();
         else requestAnimationFrame(check);
       };
-      hardTimer = setTimeout(() => {
-        stats.settleCap += 1;
-        finish();
-      }, WAIT_MS);
+      hardTimer = setTimeout(finish, WAIT_MS);
       requestAnimationFrame(check);
     });
   }
@@ -701,7 +690,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     let stableSince = 0;
     let emptyTries = 0;
     while (!cancelRequested && Date.now() < deadline) {
-      stats.probeRounds += 1;
       const { sig } = await extractFrameSvg(src, 'probe');
       if (!sig) {
         emptyTries += 1;
@@ -957,7 +945,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const originBehavior = scroller.style.scrollBehavior;
     const collected = new Map();
     const startedAt = Date.now();
-    const collectStartedAt = performance.now();
     let steps = 0;
 
     try {
@@ -983,19 +970,15 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         await settled;
         if (pos >= scroller.scrollHeight - scroller.clientHeight) break;
       }
-      const collectedMs = Math.round(performance.now() - collectStartedAt);
       if (!cancelRequested) {
         await collectVisibleBlocks(pageEl, scroller, collected, overlay);
         await enhanceMedia(pageEl, scroller, collected, overlay);
       }
-      stats.steps = steps;
       return {
         blocks: [...collected.values()]
           .sort((a, b) => a.top - b.top)
           .map((item) => item.el),
         limited: steps >= MAX_STEPS || Date.now() - startedAt >= MAX_MS,
-        collectMs: collectedMs,
-        enhanceMs: Math.round(performance.now() - collectStartedAt) - collectedMs,
       };
     } finally {
       scroller.scrollTop = origin;
@@ -1042,12 +1025,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         return '';
       }
     };
-    const startedAt = performance.now();
     const task = new Promise((resolve) => {
       try {
         canvas.toBlob((blob) => {
-          stats.encodeMs += performance.now() - startedAt;
-          stats.encodePx += canvas.width * canvas.height;
           if (!blob) {
             resolve(fallback());
             return;
@@ -1132,8 +1112,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 
     const apply = (img, dataUrl) => {
       if (dataUrl) {
-        stats.imgCount += 1;
-        stats.imgBytes += dataUrl.length;
         img.setAttribute('src', dataUrl);
         return;
       }
@@ -1256,11 +1234,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
           border:0 solid;overflow:clip;background:#eff0f1;border-radius:2px}
         progress::-webkit-progress-bar{background:transparent}
         progress::-webkit-progress-value{background:#3370ff;border-radius:2px}
-        @media (prefers-reduced-motion: no-preference){
-          progress::-webkit-progress-value{transition:inline-size .2s}
-        }
-        .sr-only{position:absolute;clip-path:inset(50%);overflow:hidden;width:1px;height:1px;
-          margin:-1px;padding:0;border:0;white-space:nowrap}
         .ok .title{color:#2ea121}
         .err .title{color:#d83931}
       </style>
@@ -1271,16 +1244,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         </div>
         <div class="msg">准备中…</div>
         <progress max="100" value="0" aria-label="导出进度"></progress>
-        <p class="sr-only" role="status"></p>
-        <p class="sr-only" role="alert"></p>
       </div>`;
     document.documentElement.appendChild(host);
 
     const card = root.querySelector('.card');
     const msg = root.querySelector('.msg');
     const bar = root.querySelector('progress');
-    const status = root.querySelector('[role="status"]');
-    const alert = root.querySelector('[role="alert"]');
     const cancel = root.querySelector('.cancel');
     let cancelled = false;
 
@@ -1315,8 +1284,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         if (kind === 'ok' || kind === 'err') card.classList.add(kind);
         if (kind === 'ok') bar.value = 100;
         msg.textContent = text;
-        if (kind === 'err') alert.textContent = text;
-        else status.textContent = text;
         setTimeout(() => host.remove(), timeout);
       },
     };
@@ -1330,9 +1297,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     running = true;
     cancelRequested = false;
     pendingEncodes.clear();
-    for (const key of Object.keys(stats)) stats[key] = 0;
-    const startedAt = performance.now();
-    const profile = {};
     const overlay = createOverlay(() => {
       cancelRequested = true;
     });
@@ -1352,25 +1316,19 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       overlay.update('收集内容…', 0);
 
       imageInliner = createImageInliner(overlay);
-      const { blocks, limited, collectMs, enhanceMs } = await collectBlocks(pageEl, overlay);
-      profile.collectMs = collectMs;
-      profile.enhanceMs = enhanceMs;
+      const { blocks, limited } = await collectBlocks(pageEl, overlay);
       if (finishIfCancelled()) return;
       if (!blocks.length) {
         overlay.finish('未找到文档内容', 'err');
         return;
       }
 
-      const flushStartedAt = performance.now();
       const failedImages = await imageInliner.flush(blocks);
-      profile.flushMs = Math.round(performance.now() - flushStartedAt);
       if (finishIfCancelled()) return;
 
-      const buildStartedAt = performance.now();
       overlay.update('生成文件…', 0.97);
       const parts = buildHtmlParts(title, blocks, theme, location.href);
       const size = downloadHtml(`${sanitizeFilename(title)}.html`, parts);
-      profile.buildMs = Math.round(performance.now() - buildStartedAt);
 
       const notes = [];
       if (limited) notes.push('可能不完整');
@@ -1386,13 +1344,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       cancelRequested = false;
       imageInliner = null;
       pendingEncodes.clear();
-      console.info('[feishu-doc-exporter] profile', {
-        ...stats,
-        settleMs: Math.round(stats.settleMs),
-        encodeMs: Math.round(stats.encodeMs),
-        ...profile,
-        totalMs: Math.round(performance.now() - startedAt),
-      });
     }
   }
 
