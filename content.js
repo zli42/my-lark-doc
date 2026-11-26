@@ -733,8 +733,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   // 画板快照可能连大片空白画布一起导出；按 alpha 内容边界裁剪并留出内边距。
   // 全分辨率逐像素扫描在大画板上是长任务，改在最长边 1024 的缩略图上求边界再映射回原图，
   // 误差远小于 8px 内边距
-  function boardContentBox(canvas, cssWidth) {
-    const { width, height } = canvas;
+  function boardContentBox(canvases, width, height, cssWidth) {
+    if (!width || !height) return null;
     const probeScale = Math.min(1, 1024 / Math.max(width, height));
     const probeWidth = Math.max(1, Math.round(width * probeScale));
     const probeHeight = Math.max(1, Math.round(height * probeScale));
@@ -742,7 +742,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     probe.width = probeWidth;
     probe.height = probeHeight;
     const probeContext = probe.getContext('2d', { willReadFrequently: true });
-    probeContext.drawImage(canvas, 0, 0, probeWidth, probeHeight);
+    const scaleX = probeWidth / width;
+    const scaleY = probeHeight / height;
+    canvases.forEach((canvas) => {
+      probeContext.drawImage(canvas, 0, 0, canvas.width * scaleX, canvas.height * scaleY);
+    });
     const { data } = probeContext.getImageData(0, 0, probeWidth, probeHeight);
     let left = probeWidth;
     let top = probeHeight;
@@ -796,27 +800,29 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (!canvases.length) return;
       if (!cancelRequested && !grown()) warn('board upscale timeout, using current canvas');
       await waitForPaint(); // 等重绘帧提交
-      const snapshot = document.createElement('canvas');
-      snapshot.width = canvases[0].width;
-      snapshot.height = canvases[0].height;
-      const context = snapshot.getContext('2d');
-      canvases.forEach((canvas) => context.drawImage(canvas, 0, 0));
-      const box = boardContentBox(snapshot, cssWidth);
+      const fullWidth = canvases[0].width;
+      const fullHeight = canvases[0].height;
+      const box = boardContentBox(canvases, fullWidth, fullHeight, cssWidth);
+      const composed = document.createElement('canvas');
+      composed.width = box ? box.w : fullWidth;
+      composed.height = box ? box.h : fullHeight;
+      const context = composed.getContext('2d');
+      const sx = box ? box.x : 0;
+      const sy = box ? box.y : 0;
+      canvases.forEach((canvas) => {
+        context.drawImage(canvas, sx, sy, composed.width, composed.height, 0, 0, composed.width, composed.height);
+      });
       if (!box) {
-        encodeCanvasToImg(img, snapshot); // 全透明画布没有可裁的内容
+        encodeCanvasToImg(img, composed); // 全透明画布没有可裁的内容
         return;
       }
-      const cropped = document.createElement('canvas');
-      cropped.width = box.w;
-      cropped.height = box.h;
-      cropped.getContext('2d').drawImage(snapshot, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
       // 裁掉空白画布后按原块宽铺满，块高随图片比例收缩
       const figure = document.createElement('div');
       ['Top', 'Right', 'Bottom', 'Left'].forEach((side) => {
         figure.style[`margin${side}`] = boardEl.style[`margin${side}`] || '0px';
       });
       const croppedImg = document.createElement('img');
-      encodeCanvasToImg(croppedImg, cropped);
+      encodeCanvasToImg(croppedImg, composed);
       croppedImg.alt = '画布快照';
       croppedImg.style.cssText = 'display:block;width:100%;height:auto';
       figure.appendChild(croppedImg);
