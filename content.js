@@ -14,7 +14,7 @@
   const WAIT_MS = 350;
   const IMAGE_CONCURRENCY = 16;
   const IMAGE_TIMEOUT_MS = 15000;
-  const BOARD_SCALE = 3;
+  const BOARD_SCALE = 5;
   const BOARD_CROP_PADDING = 8;
 
   const REMOVE_SELECTOR = [
@@ -95,7 +95,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 
   // 克隆图 → 页面里的活节点，抓取失败时用后者已解码的像素兜底
   const liveImages = new WeakMap();
-  // 1 倍画布快照先不编码：画板增强成功时这张会被 3 倍图替换，只在兜底路径编码
+  // 1 倍画布快照先不编码：画板增强成功时这张会被 5 倍图替换，只在兜底路径编码
   const pendingBoardCanvas = new WeakMap();
   let running = false;
   let cancelRequested = false;
@@ -212,7 +212,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       canvas.height = liveCanvases[0].height;
       const context = canvas.getContext('2d');
       liveCanvases.forEach((item) => context.drawImage(item, 0, 0));
-      // 编码推迟到 flush：增强成功时这张 1 倍图会被 3 倍图替换
+      // 编码推迟到 flush：增强成功时这张 1 倍图会被 5 倍图替换
       const img = document.createElement('img');
       pendingBoardCanvas.set(img, canvas);
       img.alt = '画布快照';
