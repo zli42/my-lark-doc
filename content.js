@@ -12,7 +12,7 @@
   const MAX_MS = 180000;
   const STEP_RATIO = 0.8;
   const WAIT_MS = 350;
-  const IMAGE_CONCURRENCY = 10;
+  const IMAGE_CONCURRENCY = 16;
   const IMAGE_TIMEOUT_MS = 15000;
   const BOARD_SCALE = 3;
   const BOARD_CROP_PADDING = 8;
@@ -95,6 +95,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 
   // 克隆图 → 页面里的活节点，抓取失败时用后者已解码的像素兜底
   const liveImages = new WeakMap();
+  // 1 倍画布快照先不编码：画板增强成功时这张会被 3 倍图替换，只在兜底路径编码
+  const pendingBoardCanvas = new WeakMap();
   let running = false;
   let cancelRequested = false;
   let imageInliner = null;
@@ -169,7 +171,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
   }
 
   function inlineStyles(liveEl, cloneEl, inEmbed, textSet) {
-    cloneEl.removeAttribute('style');
     const computed = getComputedStyle(liveEl);
     // 导出后字体回退/容器宽度变化会让文本重新换行，固定高度会把后续块压上来；
     // 画板/图表等嵌入块的高度是画布视口尺寸，评论文案等文本不能触发高度省略。
@@ -177,6 +178,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       !inEmbed &&
       (computed.position === 'static' || computed.position === 'relative') &&
       textSet.has(liveEl);
+    // 逐个 setProperty 会把同一个 style 属性重解析上百次，拼成一段一次写入
+    const parts = [];
     for (const prop of STYLE_PROPS) {
       if (flowingText && (prop === 'height' || prop === 'min-height' || prop === 'max-height')) continue;
       const value = computed.getPropertyValue(prop);
@@ -184,8 +187,10 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (prop === 'opacity' && value === '1') continue;
       if (!ALWAYS_KEEP.has(prop) && SKIP_VALUES.has(value)) continue;
       if (prop === 'background-image' && value.includes('url(')) continue; // 外链背景离线不可用
-      cloneEl.style.setProperty(prop, value);
+      parts.push(`${prop}:${value}`);
     }
+    if (parts.length) cloneEl.setAttribute('style', parts.join(';'));
+    else cloneEl.removeAttribute('style');
 
     for (let i = 0; i < liveEl.children.length && i < cloneEl.children.length; i += 1) {
       const child = liveEl.children[i];
@@ -207,8 +212,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       canvas.height = liveCanvases[0].height;
       const context = canvas.getContext('2d');
       liveCanvases.forEach((item) => context.drawImage(item, 0, 0));
+      // 编码推迟到 flush：增强成功时这张 1 倍图会被 3 倍图替换
       const img = document.createElement('img');
-      img.src = canvas.toDataURL('image/png');
+      pendingBoardCanvas.set(img, canvas);
       img.alt = '画布快照';
       const style = cloneCanvases[0].getAttribute('style');
       if (style) img.setAttribute('style', style);
@@ -345,9 +351,15 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
           content.style.minHeight = `${viewHeight}px`;
           content.style.maxHeight = `${viewHeight}px`;
           scroller.scrollTop = Math.max(0, scroller.scrollTop + content.getBoundingClientRect().top - viewTop);
-          await sleep(WAIT_MS);
+          await waitForPaint();
           for (let top = 0; top <= content.scrollHeight && !cancelRequested; top += step) {
             content.scrollTop = top;
+            await waitForPaint();
+            harvest();
+          }
+          // 容器重排后首屏行可能晚挂载，回到顶部再补一次，代替原先固定 350ms 的等待
+          if (!cancelRequested) {
+            content.scrollTop = 0;
             await waitForPaint();
             harvest();
           }
@@ -491,7 +503,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         (!block.querySelector('.docx-block-loading-visible') && (!needsCanvas || block.querySelector('canvas')))
       );
     }, 5000);
-    if (!cancelRequested && block.querySelector('canvas')) await sleep(200); // 等画布完成首帧绘制
+    if (!cancelRequested && block.querySelector('canvas')) await waitForPaint(); // 等画布首帧提交
   }
 
   // 虚拟滚动换块时 DOM 会连续变更；先确认滚动后确实有过渲染提交（DOM 变更或签名变化），
@@ -663,25 +675,32 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
   }
 
-  // 小组件在 iframe 内渐进渲染：等 400ms 后每 300ms 取一次 SVG，序列化长度连续两次一致即采用。
-  // 连续 3 次取不到矢量图（约 1.2s）就回退截图，避免非 SVG 组件被拖到 3s 上限
+  // 小组件在 iframe 内渐进渲染：每 100ms 取一次 SVG，序列化长度连续两次一致且保持 150ms 才采用。
+  // 连续 4 次取不到矢量图（约 400ms）就回退截图，避免非 SVG 组件被拖到 3s 上限
   async function extractStableSvg(src) {
-    await sleep(400);
     const deadline = Date.now() + 3000;
     let lastLength = 0;
+    let stableSince = 0;
     let emptyTries = 0;
     while (!cancelRequested && Date.now() < deadline) {
       const svg = parseSvg(await extractFrameSvg(src));
       if (!svg) {
         emptyTries += 1;
-        if (emptyTries >= 3) return null;
+        if (emptyTries >= 4) return null;
+        lastLength = 0;
+        stableSince = 0;
       } else {
         emptyTries = 0;
         const length = svg.outerHTML.length;
-        if (length === lastLength) return svg;
-        lastLength = length;
+        if (length === lastLength) {
+          if (!stableSince) stableSince = Date.now();
+          if (Date.now() - stableSince >= 150) return svg;
+        } else {
+          lastLength = length;
+          stableSince = 0;
+        }
       }
-      await sleep(300);
+      await sleep(100);
     }
     return null;
   }
@@ -709,17 +728,27 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     warn('嵌入图截图失败：', reason);
   }
 
-  // 画板快照可能连大片空白画布一起导出；按 alpha 内容边界裁剪并留出内边距
+  // 画板快照可能连大片空白画布一起导出；按 alpha 内容边界裁剪并留出内边距。
+  // 全分辨率逐像素扫描在大画板上是长任务，改在最长边 1024 的缩略图上求边界再映射回原图，
+  // 误差远小于 8px 内边距
   function boardContentBox(canvas, cssWidth) {
     const { width, height } = canvas;
-    const { data } = canvas.getContext('2d').getImageData(0, 0, width, height);
-    let left = width;
-    let top = height;
+    const probeScale = Math.min(1, 1024 / Math.max(width, height));
+    const probeWidth = Math.max(1, Math.round(width * probeScale));
+    const probeHeight = Math.max(1, Math.round(height * probeScale));
+    const probe = document.createElement('canvas');
+    probe.width = probeWidth;
+    probe.height = probeHeight;
+    const probeContext = probe.getContext('2d', { willReadFrequently: true });
+    probeContext.drawImage(canvas, 0, 0, probeWidth, probeHeight);
+    const { data } = probeContext.getImageData(0, 0, probeWidth, probeHeight);
+    let left = probeWidth;
+    let top = probeHeight;
     let right = -1;
     let bottom = -1;
-    for (let y = 0; y < height; y += 1) {
-      const row = y * width;
-      for (let x = 0; x < width; x += 1) {
+    for (let y = 0; y < probeHeight; y += 1) {
+      const row = y * probeWidth;
+      for (let x = 0; x < probeWidth; x += 1) {
         if (data[(row + x) * 4 + 3] <= 8) continue;
         if (x < left) left = x;
         if (x > right) right = x;
@@ -728,6 +757,10 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       }
     }
     if (right < left) return null;
+    left = Math.floor((left * width) / probeWidth);
+    right = Math.ceil(((right + 1) * width) / probeWidth) - 1;
+    top = Math.floor((top * height) / probeHeight);
+    bottom = Math.ceil(((bottom + 1) * height) / probeHeight) - 1;
     const pad = Math.round((BOARD_CROP_PADDING * width) / cssWidth);
     const x = Math.max(0, left - pad);
     const y = Math.max(0, top - pad);
@@ -760,7 +793,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       const canvases = [...layer.querySelectorAll('canvas')];
       if (!canvases.length) return;
       if (!cancelRequested && !grown()) warn('board upscale timeout, using current canvas');
-      await sleep(200); // 等重绘帧提交
+      await waitForPaint(); // 等重绘帧提交
       const snapshot = document.createElement('canvas');
       snapshot.width = canvases[0].width;
       snapshot.height = canvases[0].height;
@@ -809,11 +842,30 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     if (!items.length) return;
     items.sort((a, b) => a.item.top - b.item.top);
     overlay.update('补采嵌入内容…', 0.7);
+    const viewTop = getViewTop(scroller);
+    const viewBottom = viewTop + scroller.clientHeight;
+    // 相邻条目常常同屏：已在视口内就不重复滚动和固定等待。
+    // 要求至少一半可见（按块高与视口高较小者计），避免边缘刚露出的条目被误判。
+    const visibleEnough = (el, kind) => {
+      const rect = el.getBoundingClientRect();
+      if (kind === 'board' && !el.querySelector('canvas')) return false;
+      const overlap = Math.min(rect.bottom, viewBottom) - Math.max(rect.top, viewTop);
+      const need = Math.min(Math.max(rect.height, 1), viewBottom - viewTop) * 0.5;
+      return overlap >= need;
+    };
     for (const { id, item, kind } of items) {
       if (cancelRequested) return;
-      scroller.scrollTop = Math.max(0, item.top - (scroller.clientHeight - item.height) / 2);
-      await sleep(WAIT_MS);
-      const live = pageEl.querySelector(`.block[data-record-id="${id}"]`);
+      const selector = `.block[data-record-id="${id}"]`;
+      let live = pageEl.querySelector(selector);
+      if (!live || !visibleEnough(live, kind)) {
+        scroller.scrollTop = Math.max(0, item.top - (scroller.clientHeight - item.height) / 2);
+        // 等块真正进入视口（虚拟列表挂载/画布就位）而不是固定等 350ms
+        await waitFor(() => {
+          const el = pageEl.querySelector(selector);
+          return !!el && visibleEnough(el, kind);
+        }, 1000);
+        live = pageEl.querySelector(selector);
+      }
       if (!live) continue;
       if (kind === 'embed' && !EMBED_TYPES[typeOf(live)]?.frame) continue;
       await waitForReady(live); // 长文档滚动后画布/嵌入可能刚挂载
@@ -1023,6 +1075,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         if (seen.has(img)) continue;
         const src = img.getAttribute('src');
         if (!src) {
+          if (pendingBoardCanvas.has(img)) continue;
           img.remove();
           continue;
         }
@@ -1043,6 +1096,14 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       enqueue,
       async flush(blocks) {
         reporting = true;
+        // 增强成功时 1 倍快照已随旧节点离开文档，这里只给兜底路径补编码
+        for (const block of blocks) {
+          for (const img of block.querySelectorAll('img[alt="画布快照"]')) {
+            if (img.getAttribute('src')) continue;
+            const canvas = pendingBoardCanvas.get(img);
+            if (canvas) img.src = canvas.toDataURL('image/png');
+          }
+        }
         blocks.forEach((block) => enqueue(block));
         await Promise.all([...cache.values()]);
         return failed;
