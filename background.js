@@ -1,9 +1,11 @@
+const warn = (...args) => console.warn('[feishu-doc-exporter]', ...args);
+
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab.id) return;
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
   } catch (error) {
-    console.warn('[feishu-doc-exporter] inject failed', error);
+    warn('inject failed', error);
   }
 });
 
@@ -11,9 +13,9 @@ chrome.action.onClicked.addListener(async (tab) => {
 // probe 只回传体积指纹，避免每轮都把整棵 SVG 序列化后跨进程传输
 function pickLargestSvg(targetSrc, mode) {
   // 矢量图只可能出现在小组件子框架里，主帧与非目标帧无需扫描
-  if (window === window.top) return { href: location.href, svg: '', sig: '' };
+  if (window === window.top) return { svg: '', sig: '' };
   if (targetSrc && location.href.split('?')[0] !== targetSrc) {
-    return { href: location.href, svg: '', sig: '' };
+    return { svg: '', sig: '' };
   }
   let best = null;
   let bestArea = 0;
@@ -30,45 +32,41 @@ function pickLargestSvg(targetSrc, mode) {
     }
   };
   visit(document);
-  if (!best) return { href: location.href, svg: '', sig: '' };
+  if (!best) return { svg: '', sig: '' };
   if (mode === 'probe') {
     return {
-      href: location.href,
       svg: '',
       sig: `${best.getElementsByTagName('*').length}:${(best.textContent || '').length}`,
     };
   }
-  return { href: location.href, svg: best.outerHTML, sig: '' };
+  return { svg: best.outerHTML, sig: '' };
 }
 
 async function handleExtractSvg(message, sender) {
   if (!sender.tab) return { svg: '', sig: '' };
+  const findHit = (frames) => frames?.find((frame) => frame.result?.svg || frame.result?.sig);
   try {
     const base = String(message.src || '').split('?')[0];
     const mode = message.mode === 'probe' ? 'probe' : 'full';
     const run = (target) =>
       chrome.scripting.executeScript({ target, func: pickLargestSvg, args: [base, mode] });
-    const hasSvg = (frames) => !!frames?.some((frame) => frame.result?.svg || frame.result?.sig);
     // 先用上次命中的帧，未命中再扫全部帧兜底
-    let frames = Number.isInteger(message.frameId)
-      ? await run({ tabId: sender.tab.id, frameIds: [message.frameId] }).catch(() => null)
+    let hit = Number.isInteger(message.frameId)
+      ? findHit(await run({ tabId: sender.tab.id, frameIds: [message.frameId] }).catch(() => null))
       : null;
-    if (!hasSvg(frames)) {
-      frames = await run({ tabId: sender.tab.id, allFrames: true });
-    }
-    const hit = frames.find((frame) => frame.result?.svg || frame.result?.sig);
+    if (!hit) hit = findHit(await run({ tabId: sender.tab.id, allFrames: true }));
     return {
       svg: hit?.result?.svg || '',
       sig: hit?.result?.sig || '',
       frameId: hit?.frameId,
     };
   } catch (error) {
-    console.warn('[feishu-doc-exporter] extract svg failed', error);
+    warn('extract svg failed', error);
     return { svg: '', sig: '' };
   }
 }
 
-async function handleCaptureTab(sender) {
+async function handleCaptureTab(message, sender) {
   // captureVisibleTab 拍的是窗口内当前可见标签页，后台标签会拍到别的页面
   if (!sender.tab || !sender.tab.active) return { error: 'tab-inactive' };
   try {
@@ -93,7 +91,7 @@ function extractBitableTable(blockId) {
     if (Array.isArray(value)) return value.map(joinText).join('');
     if (typeof value === 'object') {
       if (typeof value.text === 'string') return value.text;
-      if (typeof value.link === 'string') return value.text || value.link;
+      if (typeof value.link === 'string') return value.link;
       if (typeof value.name === 'string') return value.name;
       try {
         return JSON.stringify(value);
@@ -102,6 +100,23 @@ function extractBitableTable(blockId) {
       }
     }
     return '';
+  };
+
+  const getTable = (base, id) =>
+    typeof base.getTableById === 'function' ? base.getTableById(id) : base.tableMap?.[id];
+
+  // 单元格读取优先走模型方法，缺失时回退到记录原始值
+  const readCellValue = (table, recordId, fieldId) => {
+    let value = null;
+    try {
+      value = table.getCellValue(recordId, fieldId);
+    } catch {
+      value = null;
+    }
+    if (value !== null && value !== undefined) return value;
+    const record = table.recordsMap.get(recordId);
+    const raw = record ? record[fieldId] : null;
+    return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
   };
 
   const readBitable = (block) => {
@@ -145,32 +160,21 @@ function extractBitableTable(blockId) {
     if (!store || !tableId) return null;
 
     const base = store.modelOperator.base;
-    const table = typeof base.getTableById === 'function' ? base.getTableById(tableId) : base.tableMap?.[tableId];
+    const table = getTable(base, tableId);
     if (!table || !table.fieldsMap) return null;
     // 记录没加载完时返回 null，由外层轮询重试
     if (!table.recordsMap.size && table.recordsNum > 0) return null;
 
-    const view = (table.views || []).find((item) => item.id === viewId) || (table.views || [])[0] || null;
+    const views = table.views || [];
+    const view = views.find((item) => item.id === viewId) || views[0] || null;
     const fields = view && Array.isArray(view._visibleFieldIds) && view._visibleFieldIds.length
       ? view._visibleFieldIds.map((id) => table.fieldsMap.get(id)).filter(Boolean)
       : [...table.fieldsMap.values()];
-    const allIds = [...table.recordsMap.keys()];
     const viewIds = view?._viewFilter && Array.isArray(view._viewFilter.records) ? view._viewFilter.records : null;
-    const candidates = viewIds ? viewIds.filter((id) => table.recordsMap.has(id)) : allIds;
+    const candidates = viewIds
+      ? viewIds.filter((id) => table.recordsMap.has(id))
+      : [...table.recordsMap.keys()];
     const recordIds = candidates.slice(0, MAX_ROWS);
-
-    const readCell = (recordId, fieldId) => {
-      let value = null;
-      try {
-        value = table.getCellValue(recordId, fieldId);
-      } catch {
-        value = null;
-      }
-      if (value !== null && value !== undefined) return value;
-      const record = table.recordsMap.get(recordId);
-      const raw = record ? record[fieldId] : null;
-      return raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
-    };
 
     const optionName = (field, id) => {
       const options = field.property?.options || [];
@@ -190,24 +194,11 @@ function extractBitableTable(blockId) {
     const linkText = (field, value) => {
       const ids = Array.isArray(value) ? value : value?.link_record_ids || [];
       const targetId = field.property?.tableId;
-      const target = targetId
-        ? (typeof base.getTableById === 'function' ? base.getTableById(targetId) : base.tableMap?.[targetId])
-        : null;
+      const target = targetId ? getTable(base, targetId) : null;
       return ids
         .map((id) => {
           if (!target?.recordsMap) return String(id);
-          let cell = null;
-          try {
-            cell = target.getCellValue(id, target.primaryKey);
-          } catch {
-            cell = null;
-          }
-          if (cell === null || cell === undefined) {
-            const record = target.recordsMap.get(id);
-            const raw = record ? record[target.primaryKey] : null;
-            cell = raw && typeof raw === 'object' && 'value' in raw ? raw.value : raw;
-          }
-          return joinText(cell) || String(id);
+          return joinText(readCellValue(target, id, target.primaryKey)) || String(id);
         })
         .join('、');
     };
@@ -245,7 +236,7 @@ function extractBitableTable(blockId) {
     };
 
     const rows = recordIds.map((recordId) =>
-      fields.map((field) => formatCell(field, readCell(recordId, field.id)))
+      fields.map((field) => formatCell(field, readCellValue(table, recordId, field.id)))
     );
     return {
       title,
@@ -272,23 +263,6 @@ function extractBitableTable(blockId) {
     }
     return null;
   })();
-}
-
-async function handleExtractBitable(message, sender) {
-  if (!sender.tab) return null;
-  try {
-    // 内容脚本在隔离世界读不到页面对象，提取逻辑必须注入主世界
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: sender.tab.id },
-      world: 'MAIN',
-      func: extractBitableTable,
-      args: [String(message.blockId || '')],
-    });
-    return results?.[0]?.result || null;
-  } catch (error) {
-    console.warn('[feishu-doc-exporter] extract bitable failed', error);
-    return null;
-  }
 }
 
 // 在页面主世界执行：电子表格同样由 canvas 绘制，DOM 里没有单元格文字，
@@ -373,7 +347,6 @@ function extractSheetTable(blockId) {
       fieldNames: [],
       rows,
       shown: rows.length,
-      total: rows.length,
       truncated: Number(dm.rowCount) > MAX_ROWS || Number(dm.colCount) > MAX_COLS,
     };
   };
@@ -394,38 +367,39 @@ function extractSheetTable(blockId) {
   })();
 }
 
-async function handleExtractSheet(message, sender) {
+const EXTRACTORS = {
+  'extract-bitable': extractBitableTable,
+  'extract-sheet': extractSheetTable,
+};
+
+async function handleExtractTable(message, sender) {
   if (!sender.tab) return null;
   try {
+    // 内容脚本在隔离世界读不到页面对象，提取逻辑必须注入主世界
     const results = await chrome.scripting.executeScript({
       target: { tabId: sender.tab.id },
       world: 'MAIN',
-      func: extractSheetTable,
+      func: EXTRACTORS[message.type],
       args: [String(message.blockId || '')],
     });
     return results?.[0]?.result || null;
   } catch (error) {
-    console.warn('[feishu-doc-exporter] extract sheet failed', error);
+    warn('extract table failed', error);
     return null;
   }
 }
 
+const HANDLERS = {
+  'extract-svg': handleExtractSvg,
+  'capture-tab': handleCaptureTab,
+  'extract-bitable': handleExtractTable,
+  'extract-sheet': handleExtractTable,
+};
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const handler = HANDLERS[message.type];
+  if (!handler) return;
   // 用 sendResponse 兼容旧版 Chrome；端口已关闭时忽略投递失败
-  if (message.type === 'extract-svg') {
-    handleExtractSvg(message, sender).then(sendResponse, () => {});
-    return true;
-  }
-  if (message.type === 'capture-tab') {
-    handleCaptureTab(sender).then(sendResponse, () => {});
-    return true;
-  }
-  if (message.type === 'extract-bitable') {
-    handleExtractBitable(message, sender).then(sendResponse, () => {});
-    return true;
-  }
-  if (message.type === 'extract-sheet') {
-    handleExtractSheet(message, sender).then(sendResponse, () => {});
-    return true;
-  }
+  handler(message, sender).then(sendResponse, () => {});
+  return true;
 });

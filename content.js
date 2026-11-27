@@ -496,24 +496,13 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     });
   }
 
-  // 多维表格由 canvas 绘制，DOM 里没有单元格文字；数据由页面主世界按块读取
-  async function extractBitable(blockId) {
+  // 多维表格与电子表格由 canvas 绘制，DOM 里没有单元格文字；数据由页面主世界按块读取
+  async function extractEmbedTable(type, blockId) {
     try {
-      const data = await chrome.runtime.sendMessage({ type: 'extract-bitable', blockId });
+      const data = await chrome.runtime.sendMessage({ type, blockId });
       return data && Array.isArray(data.fieldNames) && Array.isArray(data.rows) ? data : null;
     } catch (error) {
-      warn('extract bitable failed', error);
-      return null;
-    }
-  }
-
-  // 电子表格同样由 canvas 绘制，只能按块读取已加载工作表的单元格
-  async function extractSheet(blockId) {
-    try {
-      const data = await chrome.runtime.sendMessage({ type: 'extract-sheet', blockId });
-      return data && Array.isArray(data.rows) ? data : null;
-    } catch (error) {
-      warn('extract sheet failed', error);
+      warn('extract table failed', error);
       return null;
     }
   }
@@ -586,10 +575,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 
   // 画板/嵌入块挂载后先显示加载骨架，骨架期间快照会得到空白或半张图，需等骨架消失再捕获
   async function waitForReady(block) {
+    const type = typeOf(block);
     await waitFor(() => {
       // synced 容器里的画板也要等嵌套 canvas 挂载，否则同步块整体被拍成空白
       const needsCanvas =
-        typeOf(block) === 'whiteboard' || typeOf(block) === 'board' || !!block.querySelector('.docx-whiteboard-block');
+        type === 'whiteboard' || type === 'board' || !!block.querySelector('.docx-whiteboard-block');
       return (
         !block.isConnected ||
         (!block.querySelector('.docx-block-loading-visible') && (!needsCanvas || block.querySelector('canvas')))
@@ -970,7 +960,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       if (kind === 'embed' && baseEmbed) {
         await waitForReady(live);
         if (cancelRequested) return;
-        const data = liveType === 'sheet' ? await extractSheet(id) : await extractBitable(id);
+        const data = await extractEmbedTable(liveType === 'sheet' ? 'extract-sheet' : 'extract-bitable', id);
         if (cancelRequested) return;
         if (data) {
           item.el = makeEmbedTable(data);
@@ -991,14 +981,13 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const visible = [];
     for (const block of pageEl.querySelectorAll(BLOCK_SELECTOR)) {
       if (cancelRequested) return;
-      const type = typeOf(block);
-      if (type === 'page') continue;
+      if (typeOf(block) === 'page') continue;
       const parent = block.parentElement?.closest(BLOCK_SELECTOR);
       if (parent && parent !== pageEl) continue;
       // 只采视口内的块：屏幕外的媒体块还没渲染，提前捕获会拿到空白画布
       const rect = block.getBoundingClientRect();
       if (rect.bottom < viewTop || rect.top > viewBottom) continue;
-      visible.push({ block, rect, id: block.getAttribute('data-record-id'), type });
+      visible.push({ block, rect, id: block.getAttribute('data-record-id') });
     }
 
     // 同屏多个画布块各自要等骨架消失，串行等待会累加
@@ -1013,7 +1002,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         // 表格可能嵌在列表/标注块里随父块整体克隆，按单元格占位符判断是否需要补采
         if (existing.el.querySelector('td[data-record-id] .bear-virtual-renderUnit-placeholder')) {
           mergeTableCells(existing.el, block);
-          imageInliner?.enqueue(existing.el);
+          imageInliner.enqueue(existing.el);
         }
         continue;
       }
@@ -1023,7 +1012,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         : null;
       if (cancelRequested) return;
       const el = captureBlock(block, codeLineSets);
-      imageInliner?.enqueue(el);
+      imageInliner.enqueue(el);
       const top = scroller.scrollTop + rect.top - viewTop;
       // waitForReady 后加载骨架消失，块高可能变化，需重新测量；top 仍用滚动前的位置排序
       collected.set(id, {
