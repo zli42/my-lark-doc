@@ -69,6 +69,7 @@
     diagram: { label: '图表', frame: true },
     mindnote: { label: '思维导图', frame: true },
     sheet: { label: '电子表格', frame: true },
+    base_refer: { label: '多维表格', frame: true },
     bitable: { label: '多维表格', frame: true },
     isv: { label: '小组件', frame: true },
     file: { label: '附件' },
@@ -91,6 +92,11 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
 .placeholder{margin:12px 0;padding:12px 14px;border:1px dashed rgba(127,127,127,.45);border-radius:8px;opacity:.85;font-size:13px}
 .placeholder-title{font-weight:600;margin-bottom:4px}
 .placeholder a{display:inline-block;margin-top:6px;color:#3370ff;word-break:break-all}
+.export-content .bitable-table{margin:12px 0}
+.export-content .bitable-caption{font-size:12px;opacity:.65;margin-bottom:6px}
+.export-content .bitable-table table{border-collapse:collapse;width:100%;font-size:13px}
+.export-content .bitable-table th,.export-content .bitable-table td{border:1px solid rgba(127,127,127,.35);padding:6px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;word-break:break-word}
+.export-content .bitable-table th{font-weight:600;background:rgba(127,127,127,.08);white-space:nowrap}
 `;
 
   // 克隆图 → 页面里的活节点，抓取失败时用后者已解码的像素兜底
@@ -411,9 +417,16 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     cleanClone(clone);
 
     const hasMedia = !!clone.querySelector('img');
-
-    if (!hasMedia && (isEmbedType(blockType) || canvasLost || (iframeSrc && !textOf(clone)))) {
-      return makePlaceholder(blockType, clone.textContent, iframeSrc);
+    // 多维表格、Base 引用块与电子表格的网格 canvas 会被 replaceCanvases 转成隐藏的「画布快照」，
+    // 不能据此跳过占位块，否则 enhanceMedia 不会提取表格数据
+    const baseRefer =
+      (blockType === 'base_refer' || block.classList.contains('docx-base_refer-block')) &&
+      !!block.querySelector('.bitable-container, .bitable-block-container');
+    const needPlaceholder =
+      blockType === 'bitable' || blockType === 'sheet' || baseRefer ||
+      (!hasMedia && (isEmbedType(blockType) || canvasLost || (iframeSrc && !textOf(clone))));
+    if (needPlaceholder) {
+      return makePlaceholder(baseRefer ? 'base_refer' : blockType, clone.textContent, iframeSrc);
     }
     // 飞书表格的滚动/虚拟化包装层依赖页面脚本，静态 HTML 中会把宽表裁掉；
     // 只保留表格本体，交给 .table-scroll 横向滚动。
@@ -481,6 +494,79 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       const next = captured.localName === 'td' ? [...captured.childNodes] : [captured];
       cell.replaceChildren(...next);
     });
+  }
+
+  // 多维表格由 canvas 绘制，DOM 里没有单元格文字；数据由页面主世界按块读取
+  async function extractBitable(blockId) {
+    try {
+      const data = await chrome.runtime.sendMessage({ type: 'extract-bitable', blockId });
+      return data && Array.isArray(data.fieldNames) && Array.isArray(data.rows) ? data : null;
+    } catch (error) {
+      warn('extract bitable failed', error);
+      return null;
+    }
+  }
+
+  // 电子表格同样由 canvas 绘制，只能按块读取已加载工作表的单元格
+  async function extractSheet(blockId) {
+    try {
+      const data = await chrome.runtime.sendMessage({ type: 'extract-sheet', blockId });
+      return data && Array.isArray(data.rows) ? data : null;
+    } catch (error) {
+      warn('extract sheet failed', error);
+      return null;
+    }
+  }
+
+  function makeEmbedTable(data) {
+    const isSheet = data.kind === 'sheet';
+    const box = document.createElement('div');
+    box.className = 'bitable-table';
+
+    const caption = document.createElement('div');
+    caption.className = 'bitable-caption';
+    if (isSheet) {
+      const cols = data.rows[0]?.length || 0;
+      caption.textContent = data.truncated
+        ? `电子表格（仅导出前 ${data.shown} 行）`
+        : `电子表格（${data.shown} 行 × ${cols} 列）`;
+    } else {
+      const name = data.title || data.viewName;
+      const label = name ? `多维表格：${name}` : '多维表格';
+      caption.textContent = data.truncated
+        ? `${label}（仅导出前 ${data.shown} 条，共 ${data.total} 条）`
+        : `${label}（${data.shown} 条记录）`;
+    }
+    box.appendChild(caption);
+
+    const scroll = document.createElement('div');
+    scroll.className = 'table-scroll';
+    const table = document.createElement('table');
+    if (data.fieldNames.length) {
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      data.fieldNames.forEach((fieldName) => {
+        const th = document.createElement('th');
+        th.textContent = fieldName;
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+    }
+    const tbody = document.createElement('tbody');
+    data.rows.forEach((cells) => {
+      const row = document.createElement('tr');
+      cells.forEach((value) => {
+        const td = document.createElement('td');
+        td.textContent = value;
+        row.appendChild(td);
+      });
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    scroll.appendChild(table);
+    box.appendChild(scroll);
+    return box;
   }
 
   // 帧对齐轮询：渲染变化在帧提交后才可见；后台标签 rAF 暂停时用 50ms 超时兜底
@@ -874,7 +960,24 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
         live = pageEl.querySelector(selector);
       }
       if (!live) continue;
-      if (kind === 'embed' && !EMBED_TYPES[typeOf(live)]?.frame) continue;
+      const liveType = typeOf(live);
+      const isBaseRefer = liveType === 'base_refer' || live.classList.contains('docx-base_refer-block');
+      const embedType = isBaseRefer ? 'base_refer' : liveType;
+      // 多维表格、Base 引用块、电子表格与 Base 分享嵌入只以数据形式存在于页面里，优先导出为可读表格
+      const baseEmbed =
+        liveType === 'bitable' || liveType === 'sheet' || isBaseRefer ||
+        (liveType === 'iframe' && /\/base\//.test(live.querySelector('iframe')?.src || ''));
+      if (kind === 'embed' && baseEmbed) {
+        await waitForReady(live);
+        if (cancelRequested) return;
+        const data = liveType === 'sheet' ? await extractSheet(id) : await extractBitable(id);
+        if (cancelRequested) return;
+        if (data) {
+          item.el = makeEmbedTable(data);
+          continue;
+        }
+      }
+      if (kind === 'embed' && !EMBED_TYPES[embedType]?.frame) continue;
       await waitForReady(live); // 长文档滚动后画布/嵌入可能刚挂载
       if (cancelRequested) return;
       if (kind === 'board') await enhanceBoard(item, live);
@@ -903,11 +1006,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
       visible.filter(({ id }) => !collected.has(id)).map(({ block }) => waitForReady(block))
     );
 
-    for (const { block, rect, id, type } of visible) {
+    for (const { block, rect, id } of visible) {
       if (cancelRequested) return;
       const existing = collected.get(id);
       if (existing) {
-        if (type === 'table' && existing.el.querySelector('.bear-virtual-renderUnit-placeholder')) {
+        // 表格可能嵌在列表/标注块里随父块整体克隆，按单元格占位符判断是否需要补采
+        if (existing.el.querySelector('td[data-record-id] .bear-virtual-renderUnit-placeholder')) {
           mergeTableCells(existing.el, block);
           imageInliner?.enqueue(existing.el);
         }
