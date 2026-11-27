@@ -158,28 +158,31 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     return { background: '#ffffff', color };
   }
 
-  // 逐元素 textContent 会把 inlineStyles 拖成 O(n²)；先后序遍历一次，标出子树含可见文字的元素
-  function markTextElements(el, textSet) {
+  // 递归一次完成：子元素先返回子树是否含可见文字，本元素再据此决定是否省略高度
+  function inlineStyles(liveEl, cloneEl, inEmbed) {
     let hasText = false;
-    for (const child of el.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) {
-        if (/[^\s\u200b]/.test(child.nodeValue || '')) hasText = true;
-      } else if (child.nodeType === Node.ELEMENT_NODE && markTextElements(child, textSet)) {
-        hasText = true;
+    for (let i = 0; i < liveEl.children.length && i < cloneEl.children.length; i += 1) {
+      const child = liveEl.children[i];
+      const type = child.getAttribute('data-block-type');
+      const childInEmbed = type === null ? inEmbed : isEmbedType(type);
+      if (inlineStyles(child, cloneEl.children[i], childInEmbed)) hasText = true;
+    }
+    if (!hasText) {
+      for (const node of liveEl.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE && /[^\s\u200b]/.test(node.nodeValue || '')) {
+          hasText = true;
+          break;
+        }
       }
     }
-    if (hasText) textSet.add(el);
-    return hasText;
-  }
 
-  function inlineStyles(liveEl, cloneEl, inEmbed, textSet) {
     const computed = getComputedStyle(liveEl);
     // 导出后字体回退/容器宽度变化会让文本重新换行，固定高度会把后续块压上来；
     // 画板/图表等嵌入块的高度是画布视口尺寸，评论文案等文本不能触发高度省略。
     const flowingText =
       !inEmbed &&
       (computed.position === 'static' || computed.position === 'relative') &&
-      textSet.has(liveEl);
+      hasText;
     // 逐个 setProperty 会把同一个 style 属性重解析上百次，拼成一段一次写入
     const parts = [];
     for (const prop of STYLE_PROPS) {
@@ -193,13 +196,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
     if (parts.length) cloneEl.setAttribute('style', parts.join(';'));
     else cloneEl.removeAttribute('style');
-
-    for (let i = 0; i < liveEl.children.length && i < cloneEl.children.length; i += 1) {
-      const child = liveEl.children[i];
-      const type = child.getAttribute('data-block-type');
-      const childInEmbed = type === null ? inEmbed : isEmbedType(type);
-      inlineStyles(child, cloneEl.children[i], childInEmbed, textSet);
-    }
+    return hasText;
   }
 
   // 画板等嵌入块用多个 canvas 图层叠加绘制，逐层导出会得到多张图片；合成一张。
@@ -339,9 +336,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
             // 每行包在独立的 .ace-line 里，克隆外层才能保留行布局
             const unit = line.parentElement;
             const clone = unit.cloneNode(true);
-            const textSet = new WeakSet();
-            markTextElements(unit, textSet);
-            inlineStyles(unit, clone, inEmbed, textSet);
+            inlineStyles(unit, clone, inEmbed);
             cleanClone(clone);
             lines.set(num, clone);
           }
@@ -398,9 +393,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const embedOwner = block.closest('[data-block-type]')?.getAttribute('data-block-type');
     const inEmbed = isEmbedType(embedOwner);
     // 顺序有依赖：样式与 canvas 只能从活节点读取，cleanClone 会删除克隆节点
-    const textSet = new WeakSet();
-    markTextElements(block, textSet);
-    inlineStyles(block, clone, inEmbed, textSet);
+    inlineStyles(block, clone, inEmbed);
 
     const liveImgs = block.querySelectorAll('img');
     const cloneImgs = clone.querySelectorAll('img');
@@ -634,7 +627,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     const viewBottom = viewTop + viewHeight;
     overlay.hide();
     try {
-      await waitForPaint(); // 等浮层隐藏后的帧提交，避免被截进图里
       scroller.scrollTop += iframe.getBoundingClientRect().top - viewTop;
       await waitForPaint();
       let canvas;
@@ -1296,7 +1288,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Micros
     }
     running = true;
     cancelRequested = false;
-    pendingEncodes.clear();
     const overlay = createOverlay(() => {
       cancelRequested = true;
     });

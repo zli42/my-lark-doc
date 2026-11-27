@@ -56,10 +56,7 @@ async function handleExtractSvg(message, sender) {
     if (!hasSvg(frames)) {
       frames = await run({ tabId: sender.tab.id, allFrames: true });
     }
-    const hit = frames.find(
-      (frame) =>
-        (frame.result?.svg || frame.result?.sig) && frame.result.href.split('?')[0] === base
-    );
+    const hit = frames.find((frame) => frame.result?.svg || frame.result?.sig);
     return {
       svg: hit?.result?.svg || '',
       sig: hit?.result?.sig || '',
